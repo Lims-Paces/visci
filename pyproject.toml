@@ -1,0 +1,51 @@
+[project]
+name = "visci"
+version = "0.1.0"
+description = "AI short-film generator: premise in, 2-minute vertical film out"
+requires-python = ">=3.12"
+
+dependencies = [
+    # Claude — script, story bible, shot list
+    "anthropic>=0.40.0",
+    # Google Gemini — Veo video generation + Nano Banana images
+    "google-genai>=0.3.0",
+    # ElevenLabs — voice synthesis
+    "elevenlabs>=1.0.0",
+    # Data modelling + validation. Every structure that crosses a boundary
+    # (Claude's output, a file on disk) is a Pydantic model.
+    "pydantic>=2.0",
+    # Reads config from a .env file so secrets never live in code
+    "pydantic-settings>=2.0",
+    # Nice terminal output — progress, colour, tables
+    "rich>=13.0",
+    # Builds the command-line interface
+    "typer>=0.12",
+    # HTTP API for the web frontend
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    # Editable screenplay export
+    "python-docx>=1.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+# Lets you run the whole pipeline by typing `visci` in the terminal
+[project.scripts]
+visci = "visci.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+# B008 flags function calls in argument defaults. That is normally a real bug,
+# but it is exactly how Typer's API is designed to be used — `typer.Option(...)`
+# in a default is the documented pattern, not a mistake.
+ignore = ["B008"]

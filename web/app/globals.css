@@ -1,0 +1,140 @@
+@import "tailwindcss";
+
+/**
+ * Visci — dark, media-first interface.
+ *
+ * Deliberately single-theme dark: this is a tool for judging video, and a
+ * bright UI beside a moving image fights the thing you are looking at. Editing
+ * suites are dark for the same reason.
+ *
+ * The palette leans on ELEVATION rather than borders to separate surfaces —
+ * cards sit on the ground by being lighter, not by being outlined. Visible
+ * borders everywhere is what made the first version read as a form rather than
+ * an application.
+ */
+
+:root {
+  --ground: #0a0a0c;
+  --surface: #141418;
+  --raised: #1c1c22;
+  --hover: #24242b;
+  --line: #26262e;
+
+  --ink: #f2f0ec;
+  --ink-soft: #a8a5b0;
+  --ink-faint: #6b6875;
+
+  /* Amber, used sparingly — a single point of colour reads as considered;
+     colour everywhere reads as decoration. */
+  --accent: #e8a75c;
+  --accent-ink: #0a0a0c;
+
+  --good: #6fae86;
+  --warn: #d9a441;
+  --bad: #c25b4e;
+
+  --font-display: "Bricolage Grotesque", system-ui, sans-serif;
+  --font-ui: "Inter", system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, Menlo, monospace;
+
+  --r-sm: 8px;
+  --r-md: 12px;
+  --r-lg: 16px;
+}
+
+@theme inline {
+  --color-ground: var(--ground);
+  --color-surface: var(--surface);
+  --color-raised: var(--raised);
+  --color-hover: var(--hover);
+  --color-line: var(--line);
+  --color-ink: var(--ink);
+  --color-ink-soft: var(--ink-soft);
+  --color-ink-faint: var(--ink-faint);
+  --color-accent: var(--accent);
+  --color-good: var(--good);
+  --color-warn: var(--warn);
+  --color-bad: var(--bad);
+  --font-display: var(--font-display);
+  --font-ui: var(--font-ui);
+  --font-mono: var(--font-mono);
+}
+
+html,
+body {
+  background: var(--ground);
+  color: var(--ink);
+  font-family: var(--font-ui);
+  -webkit-font-smoothing: antialiased;
+}
+
+h1,
+h2,
+h3 {
+  font-family: var(--font-display);
+  letter-spacing: -0.025em;
+  text-wrap: balance;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--r-sm);
+}
+
+/* Thin, unobtrusive scrollbars — the default macOS ones are fine but Chrome on
+   other platforms draws heavy light-grey bars that break a dark interface. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--raised) transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--raised);
+  border-radius: 99px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* A slow pulse for work in progress. Calmer than a spinner, which implies
+   something is about to finish — misleading when a shot takes three minutes. */
+@keyframes breathe {
+  0%,
+  100% {
+    opacity: 0.4;
+  }
+  50% {
+    opacity: 0.85;
+  }
+}
+.breathe {
+  animation: breathe 2.4s ease-in-out infinite;
+}
+
+/* A shot card that has just arrived, easing in rather than snapping. With
+   fifteen cards filling in over ten minutes, each arrival should register. */
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.rise {
+  animation: rise 0.45s cubic-bezier(0.16, 1, 0.3, 1) both;
+}

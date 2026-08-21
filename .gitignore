@@ -1,0 +1,12 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+output/
+.pytest_cache/
+.ruff_cache/
+
+# frontend
+web/node_modules/
+web/.next/
+web/out/

@@ -1,0 +1,423 @@
+"""
+HTTP API for the web frontend.
+
+WHY THIS IS THIN
+----------------
+The pipeline already writes `state.json` after every stage — that is what makes
+runs resumable. It also happens to be a complete progress feed, so this API
+mostly just reads that file. No database, no message queue, no duplicate state.
+
+WHY BACKGROUND TASKS
+--------------------
+A film takes 10+ minutes to generate, which is far too long for an HTTP request.
+So POST /jobs starts the work and returns immediately with a job id; the client
+polls GET /jobs/{id} for progress.
+
+This is deliberately the simplest thing that works. When you outgrow it — more
+than one server, or jobs that must survive a restart — this is where Prefect
+goes, and the shape stays the same.
+"""
+
+import re
+import threading
+import uuid
+import zipfile
+from datetime import UTC, datetime
+from pathlib import Path
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
+
+from visci.config import OUTPUT_DIR, settings
+from visci.export import script_docx, script_fountain
+from visci.models import JobState, Mode
+from visci.pipeline.run import Job
+from visci.providers.base import Providers
+from visci.providers.mock import (
+    MockImageProvider,
+    MockStoryProvider,
+    MockVideoProvider,
+    MockVoiceProvider,
+)
+
+app = FastAPI(title="Visci", version="0.1.0")
+
+# The frontend runs on a different port in development, so the browser treats it
+# as a different origin. Locked to localhost — this must never become "*" in
+# anything reachable from the internet.
+# A regex rather than a fixed list: Next.js picks the next free port when 3000
+# is taken, and a mismatch produces a CORS failure that looks like the server
+# being down rather than a config problem.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origin_regex=r"http://(localhost|127\.0\.0\.1):\d+",
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Threads for running jobs, keyed by job id. In-process only: a server restart
+# loses running jobs, though their state.json survives so they can be resumed.
+_running: dict[str, threading.Thread] = {}
+
+
+# ---------------------------------------------------------------- schemas --
+
+
+class CreateJobRequest(BaseModel):
+    premise: str = Field(min_length=10, max_length=2000)
+    mode: Mode = Mode.DIALOGUE
+
+    # Real generation costs money, so it is opt-in at the API level too — the
+    # same "safe by default" rule the CLI follows.
+    real: bool = False
+    draft: bool = True
+
+
+class ShotStatus(BaseModel):
+    """One shot's progress, flattened for the UI."""
+
+    index: int
+    framing: str
+    action: str
+    line: str | None
+    speaker: str | None
+    characters: list[str]
+
+    # What the UI actually renders a status pill from.
+    status: str  # pending | keyframe | done | refused
+    has_keyframe: bool
+    has_video: bool
+    refused: bool
+
+
+class JobStatus(BaseModel):
+    job_id: str
+    premise: str
+    mode: Mode
+
+    # Which pipeline stage we are on, for the top-level progress display.
+    stage: str
+    stage_number: int
+    stages_total: int = 6
+
+    title: str | None = None
+    logline: str | None = None
+
+    shots: list[ShotStatus] = []
+    shots_done: int = 0
+    shots_total: int = 0
+    shots_refused: int = 0
+
+    cost_usd: float = 0.0
+    finished: bool = False
+    error: str | None = None
+
+
+# ------------------------------------------------------------------ logic --
+
+
+def _providers(real: bool, draft: bool) -> Providers:
+    """Mirror of the CLI's provider selection, so both paths behave identically."""
+    if not real:
+        return Providers(
+            story=MockStoryProvider(),
+            image=MockImageProvider(),
+            video=MockVideoProvider(),
+            voice=MockVoiceProvider(),
+        )
+
+    from visci.providers.claude import ClaudeStoryProvider
+    from visci.providers.gemini import (
+        GeminiImageProvider,
+        GeminiVoiceProvider,
+        VeoVideoProvider,
+    )
+
+    return Providers(
+        story=ClaudeStoryProvider(),
+        image=GeminiImageProvider(),
+        video=VeoVideoProvider(draft=draft),
+        voice=GeminiVoiceProvider(),
+    )
+
+
+def _read_state(job_id: str) -> JobState | None:
+    state_file = OUTPUT_DIR / job_id / "state.json"
+    if not state_file.exists():
+        return None
+    try:
+        return JobState.model_validate_json(state_file.read_text())
+    except Exception:  # noqa: BLE001 — a partially-written file during a
+        # concurrent save is expected, not exceptional. The next poll gets it.
+        return None
+
+
+def _stage_of(state: JobState, job_dir: Path) -> tuple[str, int]:
+    """Work out which stage a job is on, purely from what exists on disk."""
+    if state.final_video_path and Path(state.final_video_path).exists():
+        return "Finished", 6
+    if state.script:
+        clips = len(list((job_dir / "clips").glob("*.mp4"))) if job_dir.exists() else 0
+        if clips >= len([s for s in state.script.shots if not s.refused]):
+            return "Assembling film", 6
+        return "Generating shots", 5
+    if state.bible:
+        return "Writing the shot list", 3
+    if state.treatment:
+        return "Building the story bible", 2
+    return "Expanding your premise", 1
+
+
+def _to_status(state: JobState, job_id: str) -> JobStatus:
+    job_dir = OUTPUT_DIR / job_id
+    stage, number = _stage_of(state, job_dir)
+
+    shots: list[ShotStatus] = []
+    if state.script:
+        for s in state.script.shots:
+            if s.refused:
+                status = "refused"
+            elif s.video_path and Path(s.video_path).exists():
+                status = "done"
+            elif s.keyframe_path:
+                status = "keyframe"
+            else:
+                status = "pending"
+
+            shots.append(
+                ShotStatus(
+                    index=s.index,
+                    framing=s.framing.value,
+                    action=s.action,
+                    line=s.line,
+                    speaker=s.speaker,
+                    characters=s.character_names,
+                    status=status,
+                    has_keyframe=bool(s.keyframe_path),
+                    has_video=bool(s.video_path),
+                    refused=s.refused,
+                )
+            )
+
+    return JobStatus(
+        job_id=job_id,
+        premise=state.premise,
+        mode=state.mode,
+        stage=stage,
+        stage_number=number,
+        title=state.bible.title if state.bible else None,
+        logline=state.bible.logline if state.bible else None,
+        shots=shots,
+        shots_done=sum(1 for s in shots if s.status == "done"),
+        shots_total=len(shots),
+        shots_refused=sum(1 for s in shots if s.refused),
+        cost_usd=state.cost_usd,
+        finished=bool(
+            state.final_video_path and Path(state.final_video_path).exists()
+        ),
+    )
+
+
+# ----------------------------------------------------------------- routes --
+
+
+@app.post("/api/jobs", response_model=JobStatus)
+def create_job(req: CreateJobRequest) -> JobStatus:
+    """Start generating a film. Returns immediately; poll for progress."""
+    stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    job_id = f"{stamp}-{uuid.uuid4().hex[:6]}"
+
+    try:
+        providers = _providers(req.real, req.draft)
+    except RuntimeError as exc:
+        # Missing or malformed API key — a setup problem, not a server fault.
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    job = Job(job_id, req.premise, req.mode, providers)
+    job.save()  # write initial state so the very first poll finds something
+
+    def run() -> None:
+        try:
+            job.run()
+        except Exception as exc:  # noqa: BLE001 — surface any failure to the UI
+            job.state.error = str(exc)
+            job.save()
+        finally:
+            _running.pop(job_id, None)
+
+    thread = threading.Thread(target=run, daemon=True, name=f"job-{job_id}")
+    _running[job_id] = thread
+    thread.start()
+
+    return _to_status(job.state, job_id)
+
+
+@app.get("/api/jobs/{job_id}", response_model=JobStatus)
+def get_job(job_id: str) -> JobStatus:
+    """Current progress. The client polls this every couple of seconds."""
+    state = _read_state(job_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    status = _to_status(state, job_id)
+    status.error = state.error
+    return status
+
+
+@app.get("/api/jobs")
+def list_jobs() -> list[dict]:
+    """Every job on disk, newest first."""
+    if not OUTPUT_DIR.exists():
+        return []
+
+    jobs = []
+    for d in sorted(OUTPUT_DIR.iterdir(), reverse=True):
+        if not d.is_dir():
+            continue
+        state = _read_state(d.name)
+        if state is None:
+            continue
+        jobs.append(
+            {
+                "job_id": d.name,
+                "title": state.bible.title if state.bible else None,
+                "premise": state.premise[:120],
+                "mode": state.mode.value,
+                "finished": bool(
+                    state.final_video_path and Path(state.final_video_path).exists()
+                ),
+                "cost_usd": state.cost_usd,
+            }
+        )
+    return jobs
+
+
+@app.get("/api/jobs/{job_id}/video")
+def get_video(job_id: str) -> FileResponse:
+    """Stream the finished film."""
+    state = _read_state(job_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    # Fall back to a partial assembly if the full film is not ready — watching
+    # ten of fifteen shots is far better than watching nothing.
+    for candidate in (
+        state.final_video_path,
+        str(OUTPUT_DIR / job_id / f"{job_id}_partial.mp4"),
+    ):
+        if candidate and Path(candidate).exists():
+            return FileResponse(candidate, media_type="video/mp4")
+
+    raise HTTPException(status_code=404, detail="No video yet")
+
+
+@app.get("/api/jobs/{job_id}/clip/{index}")
+def get_clip(job_id: str, index: int) -> FileResponse:
+    """
+    One shot's video clip.
+
+    Lets the UI play an individual shot before the whole film exists — useful
+    for spotting a bad take early rather than discovering it in the assembly.
+    """
+    path = OUTPUT_DIR / job_id / "clips" / f"shot_{index:02d}.mp4"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="No clip")
+    return FileResponse(path, media_type="video/mp4")
+
+
+@app.get("/api/jobs/{job_id}/export")
+def export_project(job_id: str) -> FileResponse:
+    """
+    The whole project as a zip: film, clips, keyframes, references, script.
+
+    WHY THIS EXISTS
+    ---------------
+    The finished MP4 is the deliverable, but it is not the whole of what was
+    paid for. The individual clips are what someone re-cuts in a real editor;
+    the reference sheets are what keeps a sequel consistent with this film; the
+    script is the record of what was written.
+
+    Bundling them means a user owns their work rather than renting a video file
+    from us.
+    """
+    state = _read_state(job_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    job_dir = OUTPUT_DIR / job_id
+    archive = job_dir / f"{job_id}_project.zip"
+
+    # Rebuild every time rather than caching: a job in progress gains clips, and
+    # a stale zip silently missing the last five shots would be worse than the
+    # second it takes to rezip.
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
+        title = (state.bible.title if state.bible else job_id) or job_id
+        folder = _safe_name(title)
+
+        for name in (f"{job_id}.mp4", f"{job_id}_partial.mp4"):
+            path = job_dir / name
+            if path.exists():
+                zf.write(path, f"{folder}/{folder}.mp4")
+                break
+
+        for sub, label in (("clips", "clips"), ("keyframes", "keyframes"),
+                           ("references", "characters")):
+            source = job_dir / sub
+            if source.exists():
+                for f in sorted(source.iterdir()):
+                    if f.is_file():
+                        zf.write(f, f"{folder}/{label}/{f.name}")
+
+        # Two script formats, each for a real audience: the .docx opens in
+        # Word, Pages, or Google Docs and can be EDITED; the Fountain file
+        # imports into Final Draft, Highland, Slugline, and WriterDuet.
+        zf.writestr(f"{folder}/script.docx", script_docx(state))
+        zf.writestr(f"{folder}/script.fountain", script_fountain(state))
+
+        # The machine-readable record too — it is what makes the export a real
+        # backup rather than just a media dump.
+        state_file = job_dir / "state.json"
+        if state_file.exists():
+            zf.write(state_file, f"{folder}/project.json")
+
+    return FileResponse(
+        archive,
+        media_type="application/zip",
+        filename=f"{_safe_name(state.bible.title if state.bible else job_id)}.zip",
+    )
+
+
+def _safe_name(text: str) -> str:
+    """A filename that survives every operating system."""
+    cleaned = re.sub(r"[^\w\s-]", "", text).strip()
+    return re.sub(r"[\s_]+", "-", cleaned).lower() or "visci-film"
+
+
+@app.get("/api/jobs/{job_id}/keyframe/{index}")
+def get_keyframe(job_id: str, index: int) -> FileResponse:
+    """
+    One shot's keyframe image.
+
+    Lets the UI show shots appearing as they generate, which is what makes a
+    ten-minute wait tolerable — the film visibly assembles rather than sitting
+    behind a spinner.
+    """
+    path = OUTPUT_DIR / job_id / "keyframes" / f"shot_{index:02d}.png"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="No keyframe")
+    return FileResponse(path, media_type="image/png")
+
+
+@app.get("/api/config")
+def get_config() -> dict:
+    """What the UI needs to know about server capabilities and cost."""
+    return {
+        "has_anthropic_key": bool(settings.anthropic_api_key),
+        "has_gemini_key": bool(settings.gemini_api_key),
+        "estimated_cost_draft": 10.0,
+        "estimated_cost_full": 16.0,
+        "runtime_seconds": 120,
+        "shot_count": 15,
+    }
