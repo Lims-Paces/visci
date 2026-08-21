@@ -19,7 +19,7 @@
 import { usePathname } from "next/navigation";
 import Link from "next/link";
 import { useEffect, useState } from "react";
-import { listJobs, type JobSummary } from "@/lib/api";
+import { useJobs } from "@/lib/queries";
 
 function Icon({ path, className = "" }: { path: string; className?: string }) {
   return (
@@ -46,15 +46,14 @@ const ICONS = {
 
 export default function Shell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
-  const [jobs, setJobs] = useState<JobSummary[]>([]);
   const [open, setOpen] = useState(false);
 
-  useEffect(() => {
-    const load = () => listJobs().then(setJobs).catch(() => {});
-    load();
-    const t = setInterval(load, 8000);
-    return () => clearInterval(t);
-  }, [pathname]);
+  // Replaces useState + useEffect + setInterval + manual cleanup.
+  //
+  // The polling, caching, retry, and teardown all live in the hook now. It
+  // also shares one cache entry with anything else reading the film list, so
+  // there is no longer a second poll that can disagree with this one.
+  const { data: jobs = [] } = useJobs();
 
   // Close the drawer on navigation — leaving it open over the page the user
   // just chose is the classic mobile-nav annoyance.

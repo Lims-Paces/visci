@@ -12,9 +12,10 @@
  * fill in.
  */
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useRouter } from "next/navigation";
-import { createJob, getConfig, type Mode, type ServerConfig } from "@/lib/api";
+import { type Mode } from "@/lib/api";
+import { useConfig, useCreateJob } from "@/lib/queries";
 
 const EXAMPLES = [
   "A lighthouse keeper receives a transmission from a ship that sank forty years ago.",
@@ -28,15 +29,18 @@ export default function Home() {
   const [mode, setMode] = useState<Mode>("dialogue");
   const [real, setReal] = useState(false);
   const [draft, setDraft] = useState(true);
-  const [config, setConfig] = useState<ServerConfig | null>(null);
-  const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    getConfig()
-      .then(setConfig)
-      .catch(() => setError("Cannot reach the server. Is the API running?"));
-  }, []);
+  // Fetched once and cached forever — config does not change while the app is
+  // open, so staleTime: Infinity means no repeat requests.
+  const { data: config } = useConfig();
+
+  // A MUTATION, not a query. Mutations write data: they run when called, are
+  // never cached, and are never auto-retried — retrying "create film" on a
+  // network blip could start two films and charge twice.
+  //
+  // `isPending` replaces the manual `busy` flag.
+  const createJob = useCreateJob();
 
   const cost = real
     ? draft
@@ -49,14 +53,21 @@ export default function Home() {
       setError("Give it a little more to work with — a sentence or two.");
       return;
     }
-    setBusy(true);
     setError(null);
     try {
-      const job = await createJob({ premise: premise.trim(), mode, real, draft });
+      // mutateAsync throws on failure so it can be awaited in a try/catch.
+      // Its onSuccess (in lib/queries.ts) seeds the job cache and refreshes the
+      // sidebar, so the new film appears in both places immediately rather
+      // than up to 8 seconds later.
+      const job = await createJob.mutateAsync({
+        premise: premise.trim(),
+        mode,
+        real,
+        draft,
+      });
       router.push(`/job/${job.job_id}`);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not start the film.");
-      setBusy(false);
     }
   }
 
@@ -111,10 +122,10 @@ export default function Home() {
             </span>
             <button
               onClick={start}
-              disabled={busy}
+              disabled={createJob.isPending}
               className="rounded-full bg-[var(--accent)] px-5 py-2 text-sm font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-40"
             >
-              {busy ? "Starting…" : "Create"}
+              {createJob.isPending ? "Starting…" : "Create"}
             </button>
           </span>
         </div>

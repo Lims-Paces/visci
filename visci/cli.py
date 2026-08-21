@@ -190,6 +190,11 @@ def generate(
     try:
         final = job.run()
     except Exception as exc:  # top level: catch everything, report cleanly
+        # Persist the failure, not just print it. Without this a killed CLI run
+        # leaves state.json saying "Generating shots" forever, and the web UI
+        # polls a job that will never progress.
+        job.state.error = str(exc)
+        job.save()
         console.print(f"\n[bold red]Failed:[/] {exc}")
         console.print(
             f"[dim]State saved. Resume with: visci generate '' --job-id {job_id}[/]"

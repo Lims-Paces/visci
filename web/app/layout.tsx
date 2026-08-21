@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import Providers from "./components/Providers";
 import Shell from "./components/Shell";
 
 export const metadata: Metadata = {
@@ -27,7 +28,11 @@ export default function RootLayout({
         />
       </head>
       <body>
-        <Shell>{children}</Shell>
+        {/* Providers must wrap Shell, because Shell itself uses a query for
+            the film list. Anything calling useQuery has to be inside this. */}
+        <Providers>
+          <Shell>{children}</Shell>
+        </Providers>
       </body>
     </html>
   );

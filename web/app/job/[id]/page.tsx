@@ -20,12 +20,11 @@ import { use, useEffect, useState } from "react";
 import {
   clipUrl,
   exportUrl,
-  getJob,
   keyframeUrl,
   videoUrl,
-  type JobStatus,
   type Shot,
 } from "@/lib/api";
+import { useJob } from "@/lib/queries";
 
 const STATUS: Record<Shot["status"], { dot: string; label: string }> = {
   done: { dot: "bg-[var(--good)]", label: "ready" },
@@ -40,37 +39,31 @@ export default function JobPage({
   params: Promise<{ id: string }>;
 }) {
   const { id } = use(params);
-  const [job, setJob] = useState<JobStatus | null>(null);
-  const [error, setError] = useState<string | null>(null);
   const [playing, setPlaying] = useState<Shot | null>(null);
 
-  useEffect(() => {
-    let alive = true;
-    async function poll() {
-      try {
-        const next = await getJob(id);
-        if (!alive) return;
-        setJob(next);
-        if (!next.finished && !next.error) setTimeout(poll, 2500);
-      } catch (e) {
-        if (alive) setError(e instanceof Error ? e.message : "Lost the server.");
-      }
-    }
-    poll();
-    return () => {
-      alive = false;
-    };
-  }, [id]);
+  // Replaces ~20 lines of hand-rolled polling.
+  //
+  // What the hook does that the old loop did not:
+  //   - retries on a network blip instead of dying silently. The old poller
+  //     stopped forever on one failed request, so a brief wifi drop during a
+  //     15-minute generation meant the page never updated again.
+  //   - stops polling by itself once the job finishes
+  //   - pauses while the tab is in the background
+  //   - shares its cache with the sidebar, so both agree instantly
+  //   - shows cached data immediately when you navigate back to a film
+  const { data: job, error, isPending } = useJob(id);
 
   if (error) {
     return (
       <div className="px-5 py-12 sm:px-8 lg:px-10">
-        <p className="text-[var(--bad)]">{error}</p>
+        <p className="text-[var(--bad)]">
+          {error instanceof Error ? error.message : "Lost the server."}
+        </p>
       </div>
     );
   }
 
-  if (!job) {
+  if (isPending || !job) {
     return (
       <div className="px-5 py-12 sm:px-8 lg:px-10">
         <p className="breathe text-[var(--ink-faint)]">Loading…</p>
