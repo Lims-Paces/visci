@@ -116,7 +116,7 @@ export function useConfig() {
 export function useResumeJob(id: string) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (draft: boolean) => resumeJob(id, draft),
+    mutationFn: (draft?: boolean) => resumeJob(id, draft),
     onSuccess: (job) => {
       qc.setQueryData(keys.job(id), job);
       qc.invalidateQueries({ queryKey: keys.jobs });

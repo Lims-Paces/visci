@@ -171,6 +171,166 @@ def test_ledger_accumulates():
     assert ledger.job_total_usd == pytest.approx(3.5)
 
 
+def test_spend_that_crosses_the_ceiling_is_still_recorded(monkeypatch):
+    """
+    spend() runs AFTER a paid call, so the money is already gone. It must be
+    recorded even when it crosses a ceiling — otherwise the job total stays
+    under the cap and the run keeps dispatching paid calls it never counts.
+    """
+    monkeypatch.setattr(settings, "max_cost_per_job_usd", 3.5)
+    ledger = Ledger("test-job")
+    for _ in range(3):
+        ledger.spend(CostReport(1.0, "clip"))
+    with pytest.raises(BudgetExceeded):
+        ledger.spend(CostReport(1.0, "clip"))
+    assert ledger.job_total_usd == pytest.approx(4.0), "the crossing call must be recorded"
+
+
+def test_reservation_blocks_a_call_that_would_not_fit(monkeypatch):
+    """The ceiling vetoes a call BEFORE it is made, counting calls in flight."""
+    monkeypatch.setattr(settings, "max_cost_per_job_usd", 3.5)
+    ledger = Ledger("test-job")
+    ledger.spend(CostReport(2.0, "done already"))
+    ledger.reserve(1.0)  # one call in flight: 3.0 committed
+    with pytest.raises(BudgetExceeded):
+        ledger.reserve(1.0)  # a second concurrent call would reach 4.0
+    ledger.release(1.0)
+    assert ledger.job_total_usd == pytest.approx(2.0), "reserving spends nothing"
+
+
+class _PaidVideo(MockVideoProvider):
+    """A mock that charges $1 per clip, so ceilings can be tested for free."""
+
+    def __init__(self, estimated: float | None) -> None:
+        super().__init__()
+        self.calls = 0
+        if estimated is not None:
+            self.estimated_clip_usd = estimated
+
+    def generate(self, shot, bible, keyframe, out_path):
+        path, _ = super().generate(shot, bible, keyframe, out_path)
+        self.calls += 1  # a real provider would have charged by now
+        return path, CostReport(1.0, f"video:shot:{shot.index:02d}")
+
+
+@pytest.mark.parametrize("estimated", [1.0, None], ids=["with-estimate", "no-estimate"])
+def test_spend_ceiling_halts_a_concurrent_run(tmp_path, monkeypatch, estimated):
+    """
+    Regression: a $3.50 ceiling once let $12 of clips through, recording $3.
+
+    Every dollar spent must be recorded, and the run must stop. With a known
+    per-call estimate, reservation stops it before crossing the ceiling at all.
+    """
+    monkeypatch.setattr("visci.pipeline.run.OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr(settings, "max_cost_per_job_usd", 3.5)
+    video = _PaidVideo(estimated)
+    providers = Providers(
+        story=MockStoryProvider(),
+        image=MockImageProvider(),
+        video=video,
+        voice=MockVoiceProvider(),
+    )
+
+    job = Job("ceiling-test", "a test premise", Mode.DIALOGUE, providers, Format.FILM)
+    with pytest.raises(RuntimeError, match="ceiling"):
+        job.run()
+
+    assert job.ledger.job_total_usd == pytest.approx(video.calls * 1.0), (
+        f"spent ${video.calls}, but the ledger recorded ${job.ledger.job_total_usd}"
+    )
+    if estimated is not None:
+        assert video.calls <= 3, "reservation must stop the run before the ceiling"
+    else:
+        # No estimate means the breach is only seen after a call returns; the
+        # overshoot is then bounded by the calls already in flight.
+        assert video.calls <= 3 + settings.max_concurrent_videos
+
+
+def test_resumed_job_keeps_its_spend_history(tmp_path, monkeypatch, providers):
+    """
+    A resume must not reset the ledger to zero. If it did, every resume would
+    get a fresh per-job budget, and save() would erase what was already spent.
+    """
+    monkeypatch.setattr("visci.pipeline.run.OUTPUT_DIR", tmp_path)
+    job = Job("resume-spend", "a test premise", Mode.DIALOGUE, providers)
+    job.ledger.spend(CostReport(5.0, "earlier work"))
+    job.save()
+
+    resumed = Job("resume-spend", "a test premise", Mode.DIALOGUE, providers)
+    assert resumed.ledger.job_total_usd == pytest.approx(5.0)
+    resumed.save()
+    assert resumed.state.cost_usd == pytest.approx(5.0)
+
+
+def test_api_rejects_job_ids_that_could_escape_the_output_dir():
+    """A crafted id must never be joined onto a filesystem path."""
+    from fastapi import HTTPException
+
+    from visci.api import get_clip, get_job, get_keyframe, resume_job
+
+    for bad in ("..", "../etc", "20260101-000000-zzzzzz", "x" * 30):
+        with pytest.raises(HTTPException) as err:
+            get_job(bad)
+        assert err.value.status_code == 404
+        for route in (get_clip, get_keyframe):
+            with pytest.raises(HTTPException):
+                route(bad, 1)
+        with pytest.raises(HTTPException):
+            resume_job(bad)
+
+
+def _saved_job(tmp_path, monkeypatch, providers, real: bool) -> str:
+    """Write an unfinished job to disk, as the API would after an interruption."""
+    monkeypatch.setattr("visci.pipeline.run.OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr("visci.api.OUTPUT_DIR", tmp_path)
+    job_id = "20260101-000000-abcdef"
+    job = Job(job_id, "a test premise", Mode.DIALOGUE, providers)
+    job.state.real = real
+    job.state.draft = True
+    job.save()
+    return job_id
+
+
+def test_resume_of_a_free_preview_stays_free(tmp_path, monkeypatch, providers):
+    """A free preview must never be resumed as paid generation."""
+    from fastapi import HTTPException
+
+    from visci import api
+
+    job_id = _saved_job(tmp_path, monkeypatch, providers, real=False)
+
+    with pytest.raises(HTTPException) as err:
+        api.resume_job(job_id, real=True)
+    assert err.value.status_code == 400
+
+    status = api.resume_job(job_id)  # no flags: continues as a free preview
+    assert status.real is False
+    thread = api._running.get(job_id)
+    if thread:
+        thread.join(timeout=60)
+    assert api.get_job(job_id).finished
+
+
+def test_resume_of_a_real_job_uses_real_providers(tmp_path, monkeypatch, providers):
+    """
+    A real film must resume with real providers, never mocks. With no API keys
+    configured, choosing real providers fails setup (400) — proving the resume
+    did not quietly fall back to splicing placeholder clips into a paid film.
+    """
+    from fastapi import HTTPException
+
+    from visci import api
+
+    job_id = _saved_job(tmp_path, monkeypatch, providers, real=True)
+    monkeypatch.setattr(settings, "anthropic_api_key", "")
+    monkeypatch.setattr(settings, "gemini_api_key", "")
+
+    with pytest.raises(HTTPException) as err:
+        api.resume_job(job_id)
+    assert err.value.status_code == 400
+    assert api.get_job(job_id).real is True
+
+
 # ---------------------------------------------------------------- pipeline --
 
 

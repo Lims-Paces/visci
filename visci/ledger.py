@@ -8,15 +8,27 @@ bug that loops is not a theoretical risk — it is the single most likely way th
 project costs you real money unexpectedly. An aggressive retry on a failing shot
 can burn $100 in an hour with nobody watching.
 
-So spend is not merely observed, it is ENFORCED. Every provider call goes
-through `spend()`, which raises and halts the run before exceeding a ceiling.
-The pipeline stops with a clear error rather than quietly draining a card.
+So spend is not merely observed, it is ENFORCED, in two steps:
+
+  1. reserve()  BEFORE a paid call: the call's estimated cost is held against
+     both ceilings. If it would not fit, BudgetExceeded is raised and the call
+     is never made. Reservations are what stop several concurrent workers from
+     each seeing "just under the limit" and all dispatching at once.
+  2. spend()    AFTER a paid call: the real cost is ALWAYS recorded, because
+     the money is already gone. Only then is a ceiling checked, so a breach
+     halts the next call without making the ledger under-report this one.
+
+An earlier version checked the ceiling inside spend() and refused to record a
+call that crossed it. Since spend() runs after the API call, that meant money
+was spent but never counted, the job total stayed under the cap, and workers
+kept dispatching. A $3.50 ceiling let $12 through in testing.
 
 The daily cap persists to disk so it survives restarts. A per-process counter
 would reset every time you re-run, which defeats the purpose.
 """
 
 import json
+import threading
 from datetime import UTC, datetime
 
 from visci.config import OUTPUT_DIR, settings
@@ -39,6 +51,12 @@ class BudgetExceeded(RuntimeError):
     """Raised when a spend ceiling would be breached. Halts the run."""
 
 
+# Every Ledger in this process shares one lock for the daily file. Two jobs
+# running at once (the API allows it) would otherwise both read the same daily
+# total, add their own cost, and the second write would erase the first.
+_DAILY_LOCK = threading.Lock()
+
+
 class Ledger:
     """
     Tracks money spent on one job, and across all jobs today.
@@ -47,46 +65,86 @@ class Ledger:
     its cost through here, so there is no path where spend goes unrecorded.
     """
 
-    def __init__(self, job_id: str) -> None:
+    def __init__(self, job_id: str, already_spent_usd: float = 0.0) -> None:
         self.job_id = job_id
-        self.job_total_usd = 0.0
+        # A resumed job starts from what it has ALREADY spent. Starting at zero
+        # would hand every resume a fresh per-job budget, so repeated resumes
+        # could spend the ceiling many times over.
+        self.job_total_usd = already_spent_usd
         self.entries: list[CostReport] = []
         self._daily_file = OUTPUT_DIR / ".daily_spend.json"
 
+        # Estimated cost of calls currently in flight. Counted against the
+        # ceilings so concurrent workers cannot collectively overshoot.
+        self._reserved_usd = 0.0
+        self._lock = threading.Lock()
+
     # ------------------------------------------------------------------ api --
+
+    def reserve(self, estimate_usd: float) -> None:
+        """
+        Hold an estimated cost against both ceilings BEFORE a paid call.
+
+        Raises BudgetExceeded if the call would not fit, so it is never made.
+        Pair every successful reserve() with a release() once the call is done
+        (in a `finally`), whether it succeeded or failed.
+        """
+        if estimate_usd <= 0:
+            return
+        with self._lock, _DAILY_LOCK:
+            prospective_job = self.job_total_usd + self._reserved_usd + estimate_usd
+            if prospective_job > settings.max_cost_per_job_usd:
+                raise BudgetExceeded(
+                    f"Job {self.job_id} would reach ~${prospective_job:.2f}, over the "
+                    f"${settings.max_cost_per_job_usd:.2f} per-job ceiling. "
+                    f"Halted before spending. Raise max_cost_per_job_usd if intended."
+                )
+            prospective_daily = self._read_daily() + self._reserved_usd + estimate_usd
+            if prospective_daily > settings.max_cost_per_day_usd:
+                raise BudgetExceeded(
+                    f"Today's spend would reach ~${prospective_daily:.2f}, over the "
+                    f"${settings.max_cost_per_day_usd:.2f} daily ceiling. "
+                    f"Halted before spending. Resets at midnight UTC."
+                )
+            self._reserved_usd += estimate_usd
+
+    def release(self, estimate_usd: float) -> None:
+        """Return a reservation once its call has finished (or failed)."""
+        if estimate_usd <= 0:
+            return
+        with self._lock:
+            self._reserved_usd = max(0.0, self._reserved_usd - estimate_usd)
 
     def spend(self, report: CostReport) -> None:
         """
-        Record a cost, after checking it does not breach either ceiling.
+        Record a cost that has ALREADY been incurred, then enforce the ceilings.
 
-        Called by every provider immediately after a paid API call. Raises
-        BudgetExceeded rather than returning a failure, because continuing past
-        a spend limit is never the right behaviour.
+        Called immediately after a paid API call returns, so the money is gone.
+        It is therefore always recorded first — refusing to record it would make
+        the ledger under-report real spend. Then, if a ceiling is now crossed,
+        BudgetExceeded is raised so the run stops before the NEXT call.
         """
         if report.usd <= 0:
             # Mock mode, or a genuinely free call. Nothing to record.
             return
 
-        prospective_job = self.job_total_usd + report.usd
-        if prospective_job > settings.max_cost_per_job_usd:
-            raise BudgetExceeded(
-                f"Job {self.job_id} would reach ${prospective_job:.2f}, "
-                f"over the ${settings.max_cost_per_job_usd:.2f} per-job ceiling. "
-                f"Halted before spending. Raise max_cost_per_job_usd if intended."
-            )
+        with self._lock, _DAILY_LOCK:
+            self.job_total_usd += report.usd
+            self.entries.append(report)
+            daily = self._read_daily() + report.usd
+            self._write_daily(daily)
+            job_total = self.job_total_usd
 
-        daily = self._read_daily()
-        prospective_daily = daily + report.usd
-        if prospective_daily > settings.max_cost_per_day_usd:
+        if job_total > settings.max_cost_per_job_usd:
             raise BudgetExceeded(
-                f"Today's spend would reach ${prospective_daily:.2f}, "
-                f"over the ${settings.max_cost_per_day_usd:.2f} daily ceiling. "
-                f"Halted before spending. Resets at midnight."
+                f"Job {self.job_id} reached ${job_total:.2f}, over the "
+                f"${settings.max_cost_per_job_usd:.2f} per-job ceiling. Run halted."
             )
-
-        self.job_total_usd = prospective_job
-        self.entries.append(report)
-        self._write_daily(prospective_daily)
+        if daily > settings.max_cost_per_day_usd:
+            raise BudgetExceeded(
+                f"Today's spend reached ${daily:.2f}, over the "
+                f"${settings.max_cost_per_day_usd:.2f} daily ceiling. Run halted."
+            )
 
     def summary(self) -> str:
         """Human-readable breakdown, printed at the end of a run."""

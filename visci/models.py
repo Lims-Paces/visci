@@ -192,7 +192,7 @@ class Character(BaseModel):
 
     voice_description: str = Field(description="Age, accent, pitch, pace, texture")
 
-    # Set later, once we assign a real ElevenLabs voice. Optional because it
+    # Set later, once we assign a narrator voice (Gemini TTS). Optional because it
     # doesn't exist at the time Claude writes the bible.
     voice_id: str | None = None
 
@@ -392,6 +392,14 @@ class JobState(BaseModel):
     # a count, and the cost estimate scales with it.
     format: Format = DEFAULT_FORMAT
 
+    # Whether this job's images and video are real (paid) or mock, and which
+    # video tier. Recorded so a resume continues the SAME way the job started:
+    # resuming a free preview must never silently switch to paid generation,
+    # and resuming a real film with mocks would splice placeholder clips into
+    # it. None means the job was created before this was recorded.
+    real: bool | None = None
+    draft: bool | None = None
+
     treatment: Treatment | None = None
     bible: StoryBible | None = None
     script: Script | None = None
@@ -410,3 +418,11 @@ class JobState(BaseModel):
     # after the fact — a background thread has no other way to report to a
     # client that polls.
     error: str | None = None
+
+    def uses_real_media(self) -> bool:
+        """Whether resuming this job would spend money on images and video."""
+        if self.real is not None:
+            return self.real
+        # Older jobs did not record it. Real media costs dollars per shot, while
+        # a real-script-only run costs well under one, so spend tells them apart.
+        return self.cost_usd > 1.0

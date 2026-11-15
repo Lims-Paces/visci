@@ -140,6 +140,24 @@ def generate(
         mode = saved.mode
         fmt = saved.format
 
+        # Resume the same way the job started. A free preview resumed with
+        # --real would splice paid clips onto placeholder ones; a real film
+        # resumed without --real would splice placeholders into a paid film.
+        if saved.uses_real_media() != real:
+            if real:
+                console.print(
+                    f"[bold red]Job {job_id} was a free preview.[/]\n"
+                    "Resuming it with --real would mix placeholder and real footage. "
+                    "Start a new job with --real instead."
+                )
+            else:
+                tier = " --draft" if saved.draft else ""
+                console.print(
+                    f"[bold red]Job {job_id} uses real generation.[/]\n"
+                    f"Resume it with:  visci generate '' --job-id {job_id} --real{tier}"
+                )
+            raise typer.Exit(1)
+
     # A film cannot be generated from nothing. Without this, an empty premise
     # produces an arbitrary story and bills you for it.
     if not premise.strip():
@@ -196,6 +214,10 @@ def generate(
         raise typer.Exit(1) from exc
 
     job = Job(job_id, premise, mode, providers, fmt)
+    if job.state.real is None:
+        # Remember how this job was started, so a resume continues the same way.
+        job.state.real = real
+        job.state.draft = draft
 
     try:
         final = job.run()

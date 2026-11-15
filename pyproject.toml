@@ -9,8 +9,6 @@ dependencies = [
     "anthropic>=0.40.0",
     # Google Gemini — Veo video generation + Nano Banana images
     "google-genai>=0.3.0",
-    # ElevenLabs — voice synthesis
-    "elevenlabs>=1.0.0",
     # Data modelling + validation. Every structure that crosses a boundary
     # (Claude's output, a file on disk) is a Pydantic model.
     "pydantic>=2.0",
