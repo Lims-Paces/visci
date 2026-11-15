@@ -59,6 +59,10 @@ export interface JobStatus {
   shots_done: number;
   shots_total: number;
   shots_refused: number;
+  real: boolean;
+  draft: boolean;
+  remaining_cost_draft: number;
+  remaining_cost_full: number;
   cost_usd: number;
   finished: boolean;
   error: string | null;
@@ -117,10 +121,13 @@ export const getJob = (id: string) => request<JobStatus>(`/api/jobs/${id}`);
  * Everything already generated is kept — script, reference sheets, finished
  * clips. Only the missing shots are regenerated.
  */
-export const resumeJob = (id: string, draft: boolean) =>
-  request<JobStatus>(`/api/jobs/${id}/resume?real=true&draft=${draft}`, {
-    method: "POST",
-  });
+export const resumeJob = (id: string, draft?: boolean) =>
+  request<JobStatus>(
+    // The server resumes a job the way it started (free preview or real), so
+    // only the video tier is ever sent — never `real`.
+    `/api/jobs/${id}/resume${draft === undefined ? "" : `?draft=${draft}`}`,
+    { method: "POST" },
+  );
 export const listJobs = () => request<JobSummary[]>("/api/jobs");
 export const getConfig = () => request<ServerConfig>("/api/config");
 

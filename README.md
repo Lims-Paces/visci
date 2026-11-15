@@ -2,8 +2,8 @@
 
 Generate a 2-minute vertical short film from a one-line premise.
 
-**Status:** week 1 — the pipeline works end to end in mock mode. Real providers
-land in week 2.
+**Status:** the pipeline runs end to end in mock mode, with real providers
+(Claude, Gemini images, Veo, Gemini TTS), a web app, and resumable jobs.
 
 ---
 
@@ -43,7 +43,7 @@ takes about a second, because it runs against mock providers.
 visci generate "..." --format film      # 2 minutes instead of 30 seconds
 visci generate "..." --mode narration   # voice-over instead of on-screen dialogue
 visci config                            # show settings and whether keys are set
-pytest                                  # 13 tests, ~4 seconds
+pytest                                  # 54 tests, ~20 seconds
 ```
 
 ## Spending real money
@@ -123,8 +123,8 @@ image-to-video one — and stills cost ~40× less to iterate.
 ### Mock providers are why this is affordable to build
 
 Every external service sits behind an interface in `providers/base.py`, with two
-implementations: `real.py` (costs money) and `mock.py` (instant, free,
-deterministic).
+implementations: the real providers in `claude.py` and `gemini.py` (cost money)
+and `mock.py` (instant, free, deterministic).
 
 A full pipeline run in mock mode takes ~1 second and costs $0. Against real APIs
 it is ~12 minutes and ~$17. Over an 8-week build that is the difference between
@@ -185,9 +185,29 @@ rather than only report on it afterwards.
 
 ### Spend ceilings halt, they do not warn
 
-`ledger.py` enforces a per-job and per-day cap. Every provider call passes
-through it. The daily total persists to disk so it survives restarts — a
-per-process counter would reset exactly when you least want the safety net gone.
+`ledger.py` enforces a per-job and per-day cap in two steps:
+
+1. **Reserve before calling.** Each shot's estimated cost is held against both
+   caps before it is dispatched, counting shots already in flight. If it would
+   not fit, it is never sent — so concurrent workers cannot each see "just
+   under the limit" and overshoot together.
+2. **Record after calling.** The real cost is always recorded, because the
+   money is already spent. If a cap is now crossed, the whole run aborts.
+
+An earlier version checked the cap *before recording* and refused to record a
+call that crossed it. Since recording happens after the API call, that meant
+money spent but never counted — a $3.50 cap let $12 through in testing. There
+are regression tests for exactly this.
+
+A resumed job starts from what it has already spent, so resuming never hands
+a job a fresh budget. The daily total persists to disk so it survives restarts —
+a per-process counter would reset exactly when you least want the safety net
+gone.
+
+A resume also continues the way the job started: a free preview resumes for
+free, and a real film resumes with real providers (after showing the cost).
+Switching would either spend money nobody agreed to, or splice placeholder
+clips into a paid film.
 
 This exists because an unattended retry bug is the most likely way this project
 costs real money unexpectedly.
@@ -271,8 +291,7 @@ generated prompts, because this is easy to break accidentally.
 
 1. Vision-model verification of keyframes against reference sheets, with retry
 2. Last-frame → first-frame chaining within continuous scenes
-3. Concurrency — currently shots generate one at a time
-4. Frontend: premise input + live progress view
+3. Move job execution into Prefect, so runs survive server restarts
 
 Mock remains the default and `--real` asks before spending. Safe by default is
 deliberate: the dangerous option should always be the one you consciously choose.

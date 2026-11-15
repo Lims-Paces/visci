@@ -47,7 +47,6 @@ class Job:
         self.dir.mkdir(parents=True, exist_ok=True)
         self.state_file = self.dir / "state.json"
         self.providers = providers
-        self.ledger = Ledger(job_id)
         self.refused_shots: list[int] = []
 
         # Resume if this job already exists, otherwise start fresh.
@@ -58,6 +57,11 @@ class Job:
             self.state = JobState(
                 job_id=job_id, premise=premise, mode=mode, format=fmt
             )
+
+        # Created after state is loaded so a resumed job keeps its spend history:
+        # save() writes ledger.job_total_usd back to state.cost_usd, so a ledger
+        # starting at zero would erase the record and reset the per-job ceiling.
+        self.ledger = Ledger(job_id, already_spent_usd=self.state.cost_usd)
 
     def save(self) -> None:
         """Persist state. Called after every stage — cheap insurance."""
@@ -255,77 +259,120 @@ class Job:
         task,
         save_lock: threading.Lock,
     ) -> None:
-        """Keyframe then video for one shot, with rate-limit and refusal handling."""
-        from visci.providers.base import ContentRefused
+        """
+        Keyframe then video for one shot, retrying until done or given up.
 
+        Each attempt first RESERVES its estimated cost with the ledger. That is
+        the spend ceiling's veto: if the shot would not fit, it is never sent.
+        Reservations matter under concurrency — without them, several workers
+        each see "just under the limit" and all dispatch at once.
+        """
         attempt = 0
         while True:
             attempt += 1
             if controller.should_stop():
                 return
 
-            # The ledger gets a veto BEFORE each shot dispatches. Concurrency
-            # means a runaway bug spends 5x faster, so the spend ceiling must be
-            # able to stop work rather than only report on it afterwards.
+            estimate = self._estimated_shot_cost(shot)
             try:
-                self._check_budget()
+                self.ledger.reserve(estimate)
             except BudgetExceeded as exc:
                 controller.abort(str(exc))
                 return
 
             try:
-                if not shot.keyframe_path:
-                    kf_path = self.dir / "keyframes" / f"shot_{shot.index:02d}.png"
-                    kf, cost = self.providers.image.keyframe(
-                        shot, self.state.bible, kf_path
-                    )
-                    with save_lock:
-                        self.ledger.spend(cost)
-                    shot.keyframe_path = str(kf)
-
-                vid_path = self.dir / "clips" / f"shot_{shot.index:02d}.mp4"
-                vid, cost = self.providers.video.generate(
-                    shot, self.state.bible, Path(shot.keyframe_path), vid_path
+                finished = self._attempt_shot(
+                    shot, attempt, controller, progress, task, save_lock
                 )
-                with save_lock:
-                    self.ledger.spend(cost)
-                shot.video_path = str(vid)
+            except BudgetExceeded as exc:
+                # A ceiling was crossed by a call that already happened (its
+                # cost IS recorded). Stop the whole run, not just this shot:
+                # every other worker would otherwise keep spending.
+                controller.abort(str(exc))
+                return
+            finally:
+                self.ledger.release(estimate)
 
+            if finished:
+                return
+
+    def _estimated_shot_cost(self, shot: Shot) -> float:
+        """
+        What one attempt at this shot should cost, known before calling.
+
+        Providers expose their per-call price; mocks expose nothing, so mock
+        runs reserve $0 and are never blocked.
+        """
+        cost = getattr(self.providers.video, "estimated_clip_usd", 0.0)
+        if not shot.keyframe_path:
+            cost += getattr(self.providers.image, "estimated_image_usd", 0.0)
+        return cost
+
+    def _attempt_shot(
+        self,
+        shot: Shot,
+        attempt: int,
+        controller: ConcurrencyController,
+        progress,
+        task,
+        save_lock: threading.Lock,
+    ) -> bool:
+        """
+        One attempt at a shot. Returns True when the shot is settled (rendered,
+        refused, or given up on) and False to retry it.
+
+        BudgetExceeded is deliberately NOT handled here: it must reach
+        _generate_one_shot, which aborts the whole run.
+        """
+        try:
+            if not shot.keyframe_path:
+                kf_path = self.dir / "keyframes" / f"shot_{shot.index:02d}.png"
+                kf, cost = self.providers.image.keyframe(shot, self.state.bible, kf_path)
+                self.ledger.spend(cost)
+                shot.keyframe_path = str(kf)
+
+            vid_path = self.dir / "clips" / f"shot_{shot.index:02d}.mp4"
+            vid, cost = self.providers.video.generate(
+                shot, self.state.bible, Path(shot.keyframe_path), vid_path
+            )
+            self.ledger.spend(cost)
+            shot.video_path = str(vid)
+
+            controller.on_success()
+            self._finish_shot(shot, progress, task, save_lock)
+            return True
+
+        except BudgetExceeded:
+            raise
+
+        except ContentRefused as refusal:
+            # Pull the camera back and try once more. Observed refusals
+            # cluster on tight close-ups of a character in distress; the
+            # same beat at a wider framing renders.
+            if self._retry_wider(shot, progress):
                 controller.on_success()
                 self._finish_shot(shot, progress, task, save_lock)
-                return
+                return True
 
-            except ContentRefused as refusal:
-                # Pull the camera back and try once more. Observed refusals
-                # cluster on tight close-ups of a character in distress; the
-                # same beat at a wider framing renders.
-                if self._retry_wider(shot, progress):
-                    controller.on_success()
-                    self._finish_shot(shot, progress, task, save_lock)
-                    return
+            # A refused shot must NOT kill the film. Fourteen good shots
+            # with one gap is recoverable by rewording one line; a dead run
+            # after paying for eleven clips is not.
+            shot.refused = True
+            shot.refusal_reason = str(refusal)
+            with save_lock:
+                self.refused_shots.append(shot.index)
+            progress.console.print(f"  [yellow]shot {shot.index:02d} refused — continuing[/]")
+            self._finish_shot(shot, progress, task, save_lock)
+            return True
 
-                # A refused shot must NOT kill the film. Fourteen good shots
-                # with one gap is recoverable by rewording one line; a dead run
-                # after paying for eleven clips is not.
-                shot.refused = True
-                shot.refusal_reason = str(refusal)
-                with save_lock:
-                    self.refused_shots.append(shot.index)
-                progress.console.print(
-                    f"  [yellow]shot {shot.index:02d} refused — continuing[/]"
-                )
-                self._finish_shot(shot, progress, task, save_lock)
-                return
-
-            except Exception as exc:  # noqa: BLE001 — a worker must never
-                # propagate an unexpected error: one bad shot killing the whole
-                # film is exactly the failure this design exists to prevent.
-                # _handle_worker_error decides retry vs give-up per error type.
-                if not self._handle_worker_error(
-                    exc, shot, attempt, controller, progress
-                ):
-                    self._finish_shot(shot, progress, task, save_lock)
-                    return
+        except Exception as exc:  # noqa: BLE001 — a worker must never
+            # propagate an unexpected error: one bad shot killing the whole
+            # film is exactly the failure this design exists to prevent.
+            # _handle_worker_error decides retry vs give-up per error type.
+            if self._handle_worker_error(exc, shot, attempt, controller, progress):
+                return False
+            self._finish_shot(shot, progress, task, save_lock)
+            return True
 
     def _handle_worker_error(
         self, exc: Exception, shot: Shot, attempt: int, controller, progress
@@ -378,14 +425,6 @@ class Job:
         with save_lock:
             self.save()
             progress.advance(task)
-
-    def _check_budget(self) -> None:
-        """Raise if this job has already reached its spend ceiling."""
-        if self.ledger.job_total_usd >= settings.max_cost_per_job_usd:
-            raise BudgetExceeded(
-                f"Job {self.state.job_id} reached its "
-                f"${settings.max_cost_per_job_usd:.2f} ceiling."
-            )
 
     def _retry_wider(self, shot, progress) -> bool:
         """

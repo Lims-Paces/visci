@@ -133,20 +133,44 @@ export default function JobPage({
               keeps the script, reference sheets, and every finished clip, so
               it costs a fraction of starting over. */}
           <div className="mt-4 flex flex-wrap gap-2">
-            <button
-              onClick={() => resume.mutate(true)}
-              disabled={resume.isPending}
-              className="rounded-full bg-[var(--accent)] px-4 py-2 text-sm font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-40"
-            >
-              {resume.isPending ? "Resuming…" : "Resume · Draft"}
-            </button>
-            <button
-              onClick={() => resume.mutate(false)}
-              disabled={resume.isPending}
-              className="rounded-full bg-[var(--raised)] px-4 py-2 text-sm font-medium transition-colors hover:bg-[var(--hover)] disabled:opacity-40"
-            >
-              Resume · Standard
-            </button>
+            {job.real ? (
+              <>
+                {/* Real resumes spend money, so they show the price and ask
+                    first — the same rule as starting a real film. */}
+                <button
+                  onClick={() => {
+                    const cost = job.remaining_cost_draft.toFixed(2);
+                    if (window.confirm(`Resume with Veo Lite? This will spend roughly $${cost}.`))
+                      resume.mutate(true);
+                  }}
+                  disabled={resume.isPending}
+                  className="rounded-full bg-[var(--accent)] px-4 py-2 text-sm font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-40"
+                >
+                  {resume.isPending
+                    ? "Resuming…"
+                    : `Resume · Draft · ~$${job.remaining_cost_draft.toFixed(2)}`}
+                </button>
+                <button
+                  onClick={() => {
+                    const cost = job.remaining_cost_full.toFixed(2);
+                    if (window.confirm(`Resume with Veo Fast? This will spend roughly $${cost}.`))
+                      resume.mutate(false);
+                  }}
+                  disabled={resume.isPending}
+                  className="rounded-full bg-[var(--raised)] px-4 py-2 text-sm font-medium transition-colors hover:bg-[var(--hover)] disabled:opacity-40"
+                >
+                  {`Resume · Standard · ~$${job.remaining_cost_full.toFixed(2)}`}
+                </button>
+              </>
+            ) : (
+              <button
+                onClick={() => resume.mutate(undefined)}
+                disabled={resume.isPending}
+                className="rounded-full bg-[var(--accent)] px-4 py-2 text-sm font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-40"
+              >
+                {resume.isPending ? "Resuming…" : "Resume · free preview"}
+              </button>
+            )}
           </div>
 
           {resume.error && (

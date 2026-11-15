@@ -294,6 +294,10 @@ class GeminiImageProvider:
         )
         return paths, cost
 
+    # What one keyframe costs, known BEFORE the call. The pipeline reserves this
+    # against the spend ceiling before dispatching a shot.
+    estimated_image_usd = NANO_BANANA_PRO_USD_PER_IMAGE
+
     def keyframe(
         self, shot: Shot, bible: StoryBible, out_path: Path
     ) -> tuple[Path, CostReport]:
@@ -341,6 +345,11 @@ class VeoVideoProvider:
         self.cost_per_second = (
             VEO_FAST_720P_USD_PER_SECOND if not draft else VEO_FAST_720P_USD_PER_SECOND / 2
         )
+
+    @property
+    def estimated_clip_usd(self) -> float:
+        """What one clip costs, known BEFORE the call, for spend reservation."""
+        return self.cost_per_second * SHOT_DURATION_SECONDS
 
     def _config(self) -> types.GenerateVideosConfig:
         """
