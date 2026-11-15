@@ -41,7 +41,15 @@ just needs matching methods.
 from pathlib import Path
 from typing import Protocol
 
-from visci.models import Character, Mode, Script, Shot, StoryBible, Treatment
+from visci.models import (
+    Character,
+    Format,
+    Mode,
+    Script,
+    Shot,
+    StoryBible,
+    Treatment,
+)
 
 
 class ContentRefused(RuntimeError):
@@ -85,16 +93,22 @@ class StoryProvider(Protocol):
     regeneration of the treatment.
     """
 
-    def treatment(self, premise: str, mode: Mode) -> tuple[Treatment, CostReport]:
-        """Premise -> three-act beat sheet, sized in shots."""
+    def treatment(
+        self, premise: str, mode: Mode, fmt: Format = Format.FILM
+    ) -> tuple[Treatment, CostReport]:
+        """Premise -> beat sheet, sized in shots for the chosen format."""
         ...
 
-    def bible(self, treatment: Treatment, mode: Mode) -> tuple[StoryBible, CostReport]:
+    def bible(
+        self, treatment: Treatment, mode: Mode, fmt: Format = Format.FILM
+    ) -> tuple[StoryBible, CostReport]:
         """Treatment -> characters, locations, and visual grammar. Frozen after this."""
         ...
 
-    def script(self, bible: StoryBible, treatment: Treatment) -> tuple[Script, CostReport]:
-        """Bible + treatment -> the full 15-shot list."""
+    def script(
+        self, bible: StoryBible, treatment: Treatment, fmt: Format = Format.FILM
+    ) -> tuple[Script, CostReport]:
+        """Bible + treatment -> the shot list."""
         ...
 
 

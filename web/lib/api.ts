@@ -11,6 +11,23 @@ const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
 export type Mode = "dialogue" | "narration";
 
+/**
+ * How long a film is — and therefore what kind of story it tells.
+ *
+ * Not merely a duration: a 4-shot short is a single charged moment, while a
+ * 15-shot film has a three-act shape. The backend branches its story prompts
+ * on this, so it is a real content choice rather than a slider.
+ */
+export type Format = "short" | "film";
+
+export interface FormatInfo {
+  label: string;
+  shot_count: number;
+  runtime_seconds: number;
+  cost_draft: number;
+  cost_full: number;
+}
+
 /** How far along one shot is. Drives the status pill in the shot grid. */
 export type ShotState = "pending" | "keyframe" | "done" | "refused";
 
@@ -31,6 +48,8 @@ export interface JobStatus {
   job_id: string;
   premise: string;
   mode: Mode;
+  format: Format;
+  runtime_seconds: number;
   stage: string;
   stage_number: number;
   stages_total: number;
@@ -50,6 +69,7 @@ export interface JobSummary {
   title: string | null;
   premise: string;
   mode: Mode;
+  runtime_seconds: number;
   finished: boolean;
   cost_usd: number;
 }
@@ -57,10 +77,8 @@ export interface JobSummary {
 export interface ServerConfig {
   has_anthropic_key: boolean;
   has_gemini_key: boolean;
-  estimated_cost_draft: number;
-  estimated_cost_full: number;
-  runtime_seconds: number;
-  shot_count: number;
+  formats: Record<Format, FormatInfo>;
+  default_format: Format;
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -81,6 +99,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export function createJob(input: {
   premise: string;
   mode: Mode;
+  format: Format;
   real: boolean;
   draft: boolean;
 }) {
@@ -91,6 +110,17 @@ export function createJob(input: {
 }
 
 export const getJob = (id: string) => request<JobStatus>(`/api/jobs/${id}`);
+
+/**
+ * Continue a job that stopped partway.
+ *
+ * Everything already generated is kept — script, reference sheets, finished
+ * clips. Only the missing shots are regenerated.
+ */
+export const resumeJob = (id: string, draft: boolean) =>
+  request<JobStatus>(`/api/jobs/${id}/resume?real=true&draft=${draft}`, {
+    method: "POST",
+  });
 export const listJobs = () => request<JobSummary[]>("/api/jobs");
 export const getConfig = () => request<ServerConfig>("/api/config");
 

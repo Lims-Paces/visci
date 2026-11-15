@@ -13,13 +13,14 @@ Usage:
 
 import uuid
 from datetime import UTC, datetime
+from pathlib import Path
 
 import typer
 from rich.console import Console
 from rich.panel import Panel
 
 from visci.config import settings
-from visci.models import Mode
+from visci.models import DEFAULT_FORMAT, Format, Mode
 from visci.pipeline.run import Job
 from visci.providers.base import Providers
 from visci.providers.mock import (
@@ -78,6 +79,9 @@ def build_providers(
 def generate(
     premise: str = typer.Argument(..., help="Your movie idea, in a sentence or two."),
     mode: Mode = typer.Option(Mode.DIALOGUE, help="dialogue or narration"),
+    fmt: Format = typer.Option(
+        DEFAULT_FORMAT, "--format", help="short (30s) or film (2 min)"
+    ),
     story_real: bool = typer.Option(
         False,
         "--story-real",
@@ -134,6 +138,7 @@ def generate(
         # BEFORE money is spent rather than after.
         premise = saved.premise
         mode = saved.mode
+        fmt = saved.format
 
     # A film cannot be generated from nothing. Without this, an empty premise
     # produces an arbitrary story and bills you for it.
@@ -147,10 +152,14 @@ def generate(
     # --real implies real story generation too.
     story_real = story_real or real
 
+    # Cost scales with shot count: a 4-shot short is roughly a quarter of a
+    # 15-shot film, plus the fixed script and reference-sheet cost.
     if real:
-        estimate = 10.0 if draft else 16.0
+        per_shot = 0.53 if draft else 0.93   # video + keyframe
+        fixed = 2.2                          # script + character sheets
+        estimate = fixed + per_shot * fmt.shot_count
         tier = "Veo Lite (draft)" if draft else "Veo Fast"
-        engine_label = f"[red]REAL — {tier}, ~${estimate:.0f}[/]"
+        engine_label = f"[red]REAL — {tier}, ~${estimate:.2f}[/]"
     elif story_real:
         estimate = 0.60
         engine_label = "[yellow]REAL SCRIPT — mock video, ~$0.60[/]"
@@ -162,6 +171,7 @@ def generate(
         Panel(
             f"[bold]{premise}[/]\n\n"
             f"mode:   {mode.value}\n"
+            f"length: {fmt.label}\n"
             f"job:    {job_id}\n"
             f"engine: {engine_label}",
             title="visci",
@@ -185,7 +195,7 @@ def generate(
         console.print(f"\n[bold red]Setup problem:[/] {exc}")
         raise typer.Exit(1) from exc
 
-    job = Job(job_id, premise, mode, providers)
+    job = Job(job_id, premise, mode, providers, fmt)
 
     try:
         final = job.run()
@@ -207,6 +217,102 @@ def generate(
         console.print(job.ledger.summary())
     else:
         console.print("[dim]No spend — mock mode.[/]")
+
+
+@app.command()
+def watch(
+    job_id: str = typer.Argument(
+        None, help="Job to follow. Defaults to the most recent."
+    ),
+) -> None:
+    """
+    Follow a running job live.
+
+    `show` is a snapshot; this refreshes. Useful when a film is being generated
+    from the web UI and you want the per-shot detail that the browser does not
+    surface — which stage each shot is at, what has been refused, and what the
+    run has cost so far.
+
+    Reads `state.json`, so it never interferes with the run itself.
+    """
+    import time
+
+    from rich.live import Live
+    from rich.table import Table
+
+    from visci.config import OUTPUT_DIR
+    from visci.models import JobState
+
+    if job_id is None:
+        # Most recently modified job directory — almost always the one running.
+        dirs = [d for d in OUTPUT_DIR.iterdir() if d.is_dir()] if OUTPUT_DIR.exists() else []
+        if not dirs:
+            console.print("[red]No jobs found.[/]")
+            raise typer.Exit(1)
+        job_id = max(dirs, key=lambda d: d.stat().st_mtime).name
+        console.print(f"[dim]Following {job_id}[/]\n")
+
+    state_file = OUTPUT_DIR / job_id / "state.json"
+    if not state_file.exists():
+        console.print(f"[red]No job at {state_file}[/]")
+        raise typer.Exit(1)
+
+    def render() -> Table:
+        state = JobState.model_validate_json(state_file.read_text())
+
+        table = Table(
+            title=state.bible.title if state.bible else "Working…",
+            caption=(
+                f"{state.format.label} · ${state.cost_usd:.2f}"
+                + (f" · {state.error[:60]}" if state.error else "")
+            ),
+            expand=True,
+        )
+        table.add_column("#", width=3, justify="right")
+        table.add_column("status", width=9)
+        table.add_column("framing", width=18)
+        table.add_column("action", overflow="ellipsis", no_wrap=True)
+
+        if not state.script:
+            stage = (
+                "writing the shot list"
+                if state.bible
+                else "building the bible"
+                if state.treatment
+                else "expanding the premise"
+            )
+            table.add_row("", "[yellow]…[/]", stage, "")
+            return table
+
+        for shot in state.script.shots:
+            if shot.refused:
+                status = "[red]refused[/]"
+            elif shot.video_path and Path(shot.video_path).exists():
+                status = "[green]ready[/]"
+            elif shot.keyframe_path:
+                status = "[yellow]filming[/]"
+            else:
+                status = "[dim]queued[/]"
+            table.add_row(
+                str(shot.index + 1),
+                status,
+                shot.framing.value,
+                (shot.line or shot.action)[:80],
+            )
+        return table
+
+    try:
+        with Live(render(), refresh_per_second=1, console=console) as live:
+            while True:
+                time.sleep(2)
+                live.update(render())
+                state = JobState.model_validate_json(state_file.read_text())
+                if state.final_video_path or state.error:
+                    break
+    except KeyboardInterrupt:
+        pass
+
+    console.print("\n[dim]Stopped following.[/]")
 
 
 @app.command()

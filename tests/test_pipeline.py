@@ -14,6 +14,7 @@ from visci.models import (
     SHOT_COUNT,
     SHOT_DURATION_SECONDS,
     TARGET_RUNTIME_SECONDS,
+    Format,
     Framing,
     Mode,
     Shot,
@@ -58,6 +59,74 @@ def test_shot_arithmetic_is_consistent():
     """The locked constraints must actually divide evenly."""
     assert SHOT_COUNT * SHOT_DURATION_SECONDS == TARGET_RUNTIME_SECONDS
     assert SHOT_COUNT == 15
+
+
+def test_formats_divide_evenly_into_shots():
+    """
+    Runtime can only move in 8-second steps, because Veo requires 8s clips when
+    using reference images. Every format must respect that.
+    """
+    for fmt in Format:
+        assert fmt.runtime_seconds == fmt.shot_count * SHOT_DURATION_SECONDS
+        assert fmt.shot_count >= 1
+
+    # SHORT is really 32s; "30 seconds" is a deliberate rounding for the UI.
+    assert Format.SHORT.shot_count == 4
+    assert Format.SHORT.runtime_seconds == 32
+    assert Format.SHORT.label == "30 seconds"
+    assert Format.FILM.shot_count == 15
+
+
+def test_short_is_the_default():
+    """
+    A 30-second short costs roughly a third of a full film, which makes it the
+    right default and a far better free tier.
+    """
+    from visci.models import DEFAULT_FORMAT, JobState
+
+    assert DEFAULT_FORMAT is Format.SHORT
+    # A job created without an explicit format gets the short.
+    assert JobState(job_id="x", premise="y", mode=Mode.DIALOGUE).format is Format.SHORT
+
+
+@pytest.mark.parametrize("fmt", list(Format))
+def test_each_format_produces_a_film_of_its_own_length(
+    tmp_path, monkeypatch, providers, fmt
+):
+    """
+    Both formats must produce a correctly-sized film end to end.
+
+    This is the test that would catch a format whose shot count and runtime
+    disagree — the film would come out the wrong length with no other symptom.
+    """
+    monkeypatch.setattr("visci.pipeline.run.OUTPUT_DIR", tmp_path)
+
+    job = Job(f"fmt-{fmt.value}", "a test premise", Mode.DIALOGUE, providers, fmt)
+    final = job.run()
+
+    assert final.exists()
+    assert len(job.state.script.shots) == fmt.shot_count
+    assert probe_duration(final) == pytest.approx(fmt.runtime_seconds, abs=1.0)
+
+
+def test_short_prompt_asks_for_a_single_moment_not_three_acts():
+    """
+    Four shots is a different FORM, not a shortened film.
+
+    Asking for three acts in four shots produces a rushed setup, no middle, and
+    a punchline. The prompt must branch, not just change a number.
+    """
+    from visci.prompts.story import treatment_prompt
+
+    short = treatment_prompt("a premise", Mode.DIALOGUE, Format.SHORT).lower()
+    film = treatment_prompt("a premise", Mode.DIALOGUE, Format.FILM).lower()
+
+    assert "three-act" not in short, "a short must not be asked for three acts"
+    assert "single charged moment" in short or "no room for three acts" in short
+    assert "exactly 4 shots" in short
+
+    assert "three-act" in film
+    assert "exactly 15 shots" in film
 
 
 def test_shot_rejects_more_than_two_characters():
@@ -115,7 +184,7 @@ def test_full_pipeline_produces_a_correct_film(tmp_path, monkeypatch, providers,
     """
     monkeypatch.setattr("visci.pipeline.run.OUTPUT_DIR", tmp_path)
 
-    job = Job(f"test-{mode.value}", "a test premise", mode, providers)
+    job = Job(f"test-{mode.value}", "a test premise", mode, providers, Format.FILM)
     final = job.run()
 
     assert final.exists()
@@ -188,10 +257,9 @@ def test_visual_prompts_quote_the_bible_verbatim(providers):
     """
     from visci.prompts.visual import keyframe_prompt, video_prompt
 
-    bible, _ = providers.story.bible(
-        providers.story.treatment("x", Mode.DIALOGUE)[0], Mode.DIALOGUE
-    )
-    script, _ = providers.story.script(bible, providers.story.treatment("x", Mode.DIALOGUE)[0])
+    treatment, _ = providers.story.treatment("x", Mode.DIALOGUE, Format.FILM)
+    bible, _ = providers.story.bible(treatment, Mode.DIALOGUE, Format.FILM)
+    script, _ = providers.story.script(bible, treatment, Format.FILM)
 
     character = bible.characters[0]
     shot = next(s for s in script.shots if character.name in s.character_names)
@@ -201,9 +269,121 @@ def test_visual_prompts_quote_the_bible_verbatim(providers):
     assert character.wardrobe in prompt, "wardrobe must appear verbatim"
     assert bible.visual_style in prompt, "visual style must appear verbatim"
 
-    # The style block must also carry into the video prompt, or the clip drifts
-    # from the keyframe it was built on.
-    assert bible.visual_style in video_prompt(shot, bible)
+    # The VIDEO prompt deliberately does NOT repeat the style block.
+    #
+    # The keyframe is passed to Veo as the input image, so the still already
+    # carries the grade, grain, and lighting — the clip cannot drift from a look
+    # it is literally starting from. Re-describing it in words bloated the
+    # prompt to ~500 words, of which only ~60 described the movement, diluting
+    # attention on the one thing the video model actually has to invent.
+    video = video_prompt(shot, bible)
+    assert bible.visual_style not in video, (
+        "video prompt should not repeat the style block — the keyframe carries it"
+    )
+    assert len(video.split()) < 350, "video prompt must stay focused on motion"
+
+    # What it MUST carry is the action and explicit motion direction.
+    assert shot.action in video
+    assert "MOTION:" in video
+
+
+def test_video_prompt_gives_motion_direction():
+    """
+    Generated movement reads as unnatural in a diagnosable way: bodies move all
+    at once, at constant speed, without weight. Naming anticipation, sequencing,
+    and settling explicitly is what fixes it — "natural motion" alone does not,
+    because it does not say what natural motion consists of.
+    """
+    from visci.prompts.visual import MOTION_DIRECTION
+
+    lowered = MOTION_DIRECTION.lower()
+    assert "weight before" in lowered, "anticipation"
+    assert "lead" in lowered and "follow" in lowered, "sequencing"
+    assert "ease into stillness" in lowered, "settling"
+
+
+def test_claude_camera_direction_is_sent_through_verbatim():
+    """
+    Claude writes the camera direction and we send it unchanged.
+
+    An earlier version reduced this to a vague hint, on the theory that the
+    video model "has seen more cinema" than our enum. That was backwards: Veo
+    sees ONE keyframe and one paragraph, while Claude knows the whole film and
+    the 9:16 frame. The model with more context should compose.
+    """
+    from visci.prompts.visual import camera_direction, keyframe_prompt
+
+    shot = Shot(
+        index=0,
+        character_names=["A"],
+        location_name="x",
+        framing=Framing.CLOSE_UP,
+        camera=(
+            "85mm, her face in the upper third of the tall frame, the empty "
+            "hallway running away below her"
+        ),
+        action="She looks out of the window at the rain.",
+    )
+
+    assert camera_direction(shot) == shot.camera, "must pass through unchanged"
+
+    from visci.models import Mode, NarrationPerson, StoryBible
+
+    bible = StoryBible(
+        title="t", logline="l", mode=Mode.DIALOGUE,
+        narration_person=NarrationPerson.THIRD,
+        characters=[], locations=[],
+        visual_style="s", color_palette="p", lens_language="ll", tone="tn",
+    )
+    assert shot.camera in keyframe_prompt(shot, bible)
+
+
+def test_sensitive_shots_override_claude_camera_direction():
+    """
+    Safety beats craft on sensitive content.
+
+    A tight frame on an injury is what gets refused, so the prescribed wider
+    framing must replace whatever Claude wrote — a creative choice cannot be
+    allowed to reintroduce the exact composition that fails.
+    """
+    from visci.models import is_sensitive
+    from visci.prompts.visual import camera_direction
+
+    shot = Shot(
+        index=0,
+        character_names=["A"],
+        location_name="x",
+        framing=Framing.CLOSE_UP,
+        camera="extreme close-up, the bruise filling the entire frame",
+        action="She covers the bruise on her cheek with concealer.",
+    )
+
+    assert is_sensitive(shot)
+    result = camera_direction(shot)
+    assert result != shot.camera, "sensitive shots must not use Claude's framing"
+    assert "the room visible around them" in result
+
+
+def test_story_prompt_asks_for_real_camera_direction():
+    """
+    The prompt must ask Claude to think about the vertical frame, not to echo
+    a category back. Two people in 9:16 is the hard case and needs naming.
+    """
+    from visci.models import Mode, NarrationPerson, StoryBible, Treatment
+    from visci.prompts.story import script_prompt
+
+    bible = StoryBible(
+        title="t", logline="l", mode=Mode.DIALOGUE,
+        narration_person=NarrationPerson.THIRD,
+        characters=[], locations=[],
+        visual_style="s", color_palette="p", lens_language="ll", tone="tn",
+    )
+    prompt = script_prompt(bible, Treatment(title="t", logline="l", beats=[]),
+                           Format.FILM).lower()
+
+    assert "you are the cinematographer" in prompt
+    assert "tall vertical frame" in prompt
+    assert "two people" in prompt, "the hard case in 9:16 must be addressed"
 
 
 def test_every_framing_has_prompt_language():
@@ -211,10 +391,14 @@ def test_every_framing_has_prompt_language():
     A framing added to the enum without prompt language would raise KeyError
     mid-generation — after money has already been spent on earlier shots.
     """
-    from visci.prompts.visual import FRAMING_LANGUAGE
+    from visci.prompts.visual import FRAMING_STRICT
 
+    # Only the strict map needs full coverage now — ordinary shots use Claude's
+    # own direction, so there is no lookup that can be missing an entry. But a
+    # framing without strict phrasing would KeyError mid-generation on a
+    # sensitive shot, after money has been spent on earlier ones.
     for framing in Framing:
-        assert framing in FRAMING_LANGUAGE, f"{framing} has no prompt phrasing"
+        assert framing in FRAMING_STRICT, f"{framing} has no strict phrasing"
 
 
 # ----------------------------------------------------------------- export --
@@ -223,9 +407,9 @@ def test_every_framing_has_prompt_language():
 def _sample_state(providers):
     from visci.models import JobState
 
-    treatment, _ = providers.story.treatment("x", Mode.DIALOGUE)
-    bible, _ = providers.story.bible(treatment, Mode.DIALOGUE)
-    script, _ = providers.story.script(bible, treatment)
+    treatment, _ = providers.story.treatment("x", Mode.DIALOGUE, Format.FILM)
+    bible, _ = providers.story.bible(treatment, Mode.DIALOGUE, Format.FILM)
+    script, _ = providers.story.script(bible, treatment, Format.FILM)
     return JobState(
         job_id="export-test",
         premise="x",
@@ -425,7 +609,7 @@ def test_concurrent_generation_produces_a_complete_film(tmp_path, monkeypatch, p
     """
     monkeypatch.setattr("visci.pipeline.run.OUTPUT_DIR", tmp_path)
 
-    job = Job("concurrent-test", "a test premise", Mode.DIALOGUE, providers)
+    job = Job("concurrent-test", "a test premise", Mode.DIALOGUE, providers, Format.FILM)
     final = job.run()
 
     assert final.exists()
@@ -459,7 +643,7 @@ def test_quota_error_aborts_the_whole_run(tmp_path, monkeypatch, providers):
 
     monkeypatch.setattr(providers.video, "generate", quota_exhausted)
 
-    job = Job("quota-test", "a test premise", Mode.DIALOGUE, providers)
+    job = Job("quota-test", "a test premise", Mode.DIALOGUE, providers, Format.FILM)
     with pytest.raises(RuntimeError, match="quota"):
         job.run()
 
@@ -550,9 +734,9 @@ def test_story_prompt_teaches_filter_safe_technique():
     costs a keyframe plus a clip. This guidance exists because Veo refused a
     held close-up of a woman in visible distress.
     """
-    from visci.prompts.story import MEDIUM_BRIEF
+    from visci.prompts.story import medium_brief
 
-    lowered = MEDIUM_BRIEF.lower()
+    lowered = medium_brief(Format.FILM).lower()
     assert "aftermath" in lowered, "should teach shooting aftermath, not the act"
     assert "off-frame" in lowered, "should teach putting contact off-frame"
     # It must NOT tell Claude to avoid difficult subjects — that would produce
@@ -662,6 +846,7 @@ def test_sensitive_shots_are_widened_before_generation():
             character_names=["Dana"],
             location_name="Bathroom",
             framing=Framing.CLOSE_UP,
+            camera="85mm, the bruise centred in frame",
             action=(
                 "Tight close-up. A diffuse plum-purple bruise sits on her right "
                 "cheekbone. She dabs concealer over it."
@@ -673,6 +858,7 @@ def test_sensitive_shots_are_widened_before_generation():
             character_names=["Dana"],
             location_name="Street",
             framing=Framing.MEDIUM_CLOSE_UP,
+            camera="85mm, head and shoulders",
             action="She is smiling, holding it, eyes not moving. Her lips tremble.",
         ),
         # A safe close-up must be left alone — the rule targets sensitive
@@ -682,6 +868,7 @@ def test_sensitive_shots_are_widened_before_generation():
             character_names=["Marcus"],
             location_name="Street",
             framing=Framing.CLOSE_UP,
+            camera="50mm, his face high in the tall frame, party lights behind",
             action="He raises a red cup and grins at the crowd.",
             line="Ten years!",
         ),
@@ -708,7 +895,7 @@ def test_prompt_forbids_tight_framing_on_sensitive_content():
 
     from visci.prompts.story import script_prompt
 
-    prompt = script_prompt(bible, treatment).lower()
+    prompt = script_prompt(bible, treatment, Format.FILM).lower()
     assert "do not use `close_up`" in prompt
     assert "injury" in prompt
 
@@ -753,7 +940,7 @@ def test_refused_close_up_retries_at_wider_framing(tmp_path, monkeypatch, provid
 
     monkeypatch.setattr(providers.video, "generate", refuse_close_ups)
 
-    job = Job("widen-test", "a test premise", Mode.DIALOGUE, providers)
+    job = Job("widen-test", "a test premise", Mode.DIALOGUE, providers, Format.FILM)
     final = job.run()
 
     assert final.exists()
@@ -785,7 +972,7 @@ def test_refused_shot_does_not_kill_the_film(tmp_path, monkeypatch, providers):
 
     monkeypatch.setattr(providers.video, "generate", refuse_shot_three)
 
-    job = Job("refusal-test", "a test premise", Mode.DIALOGUE, providers)
+    job = Job("refusal-test", "a test premise", Mode.DIALOGUE, providers, Format.FILM)
     final = job.run()
 
     assert final.exists(), "a refused shot must not prevent assembly"
@@ -819,7 +1006,7 @@ def test_narration_offsets_shift_when_a_shot_is_refused(tmp_path, monkeypatch, p
 
     monkeypatch.setattr(providers.video, "generate", refuse_shot_two)
 
-    job = Job("refusal-narration", "a test premise", Mode.NARRATION, providers)
+    job = Job("refusal-narration", "a test premise", Mode.NARRATION, providers, Format.FILM)
     final = job.run()
 
     assert final.exists()
@@ -836,7 +1023,7 @@ def test_narration_measures_real_audio_duration(tmp_path, monkeypatch, providers
     """
     monkeypatch.setattr("visci.pipeline.run.OUTPUT_DIR", tmp_path)
 
-    job = Job("narration-test", "a test premise", Mode.NARRATION, providers)
+    job = Job("narration-test", "a test premise", Mode.NARRATION, providers, Format.FILM)
     job.run()
 
     spoken = [s for s in job.state.script.shots if s.audio_path]

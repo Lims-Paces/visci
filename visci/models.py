@@ -29,10 +29,63 @@ from pydantic import BaseModel, Field
 # ---------------------------------------------------------------------------
 
 SHOT_DURATION_SECONDS = 8
-TARGET_RUNTIME_SECONDS = 120
-SHOT_COUNT = TARGET_RUNTIME_SECONDS // SHOT_DURATION_SECONDS  # 15
 ASPECT_RATIO = "9:16"
 RESOLUTION = "720p"
+
+
+class Format(str, Enum):
+    """
+    How long a film is — and therefore what kind of story it can tell.
+
+    This is NOT merely a duration setting. Four shots is not a short version of
+    fifteen; it is a different form:
+
+      SHORT  4 shots.  One image, one beat, one hit. No room for a three-act
+             structure — attempting one produces incoherence. Think of a single
+             charged moment: the thing that happens, and its consequence.
+
+      FILM   15 shots. Setup, complication, turn. A real three-act shape with
+             space for a reveal in the closing shots.
+
+    So the story prompts branch on this, not just the arithmetic.
+
+    WHY THESE TWO AND NOT ARBITRARY LENGTHS
+    ---------------------------------------
+    Veo accepts only 4, 6, or 8 second clips, and REQUIRES 8 when using
+    reference images — which we depend on for character consistency. So runtime
+    can only move in 8-second steps, and "30 seconds" is really 4 shots = 32s.
+
+    More importantly, an arbitrary length means the story prompt cannot know
+    what structure to write for, and you get muddled pacing at every duration.
+    Two well-tuned formats beat infinite badly-tuned ones.
+    """
+
+    SHORT = "short"
+    FILM = "film"
+
+    @property
+    def shot_count(self) -> int:
+        return 4 if self is Format.SHORT else 15
+
+    @property
+    def runtime_seconds(self) -> int:
+        """Actual runtime. SHORT is 32s, which we present to users as ~30s."""
+        return self.shot_count * SHOT_DURATION_SECONDS
+
+    @property
+    def label(self) -> str:
+        """What the user sees. Rounded, because 32 is a technical artefact."""
+        return "30 seconds" if self is Format.SHORT else "2 minutes"
+
+
+# The default. A 30-second short costs roughly a third of a full film, which
+# makes it both the sensible starting point and a far better free tier.
+DEFAULT_FORMAT = Format.SHORT
+
+# Retained for the many call sites that predate multiple formats. Equal to the
+# FILM format so existing behaviour is unchanged where it is still used.
+TARGET_RUNTIME_SECONDS = Format.FILM.runtime_seconds
+SHOT_COUNT = Format.FILM.shot_count
 
 # ---------------------------------------------------------------------------
 # Narration pacing.
@@ -224,7 +277,39 @@ class Shot(BaseModel):
     character_names: list[str] = Field(max_length=2)
     location_name: str
 
-    framing: Framing
+    # The coarse category. Kept because two mechanical systems need a KNOWN
+    # value to reason about: the sensitivity check that widens risky shots, and
+    # the refusal-recovery ladder that steps a refused shot to the next-wider
+    # framing. Neither can work on free text.
+    framing: Framing = Field(
+        description="The broad shot size. Used for safety handling."
+    )
+
+    # The actual camera direction, written per shot.
+    #
+    # WHY CLAUDE WRITES THIS AND NOT THE VIDEO MODEL
+    # ----------------------------------------------
+    # An earlier version reduced this to a vague hint on the theory that Veo
+    # "has seen more cinema" than a seven-value enum. That was the wrong way
+    # round: Veo sees ONE keyframe and one paragraph. Claude knows the whole
+    # film — the shot before, the shot after, that this character is concealing
+    # an injury, that the antagonist dominates public space and shrinks private
+    # ones.
+    #
+    # Claude also knows the frame is 9:16, which is not a category lookup but a
+    # judgement per shot. Two people in a vertical frame needs a specific
+    # solution — stacked depth, one soft in the foreground, a mirror, an
+    # over-the-shoulder — and an enum cannot express any of those. Claude can.
+    #
+    # So the model with more context does the composing, and we pass what it
+    # writes through verbatim rather than diluting it.
+    camera: str = Field(
+        description=(
+            "How this shot is covered: lens, angle, what sits where in the "
+            "tall vertical frame, what is sharp and what falls off."
+        )
+    )
+
     action: str = Field(description="What physically happens, in visual terms only")
 
     # The line spoken during this shot. For narration mode this is voice-over;
@@ -250,6 +335,34 @@ class Shot(BaseModel):
     refusal_reason: str | None = None
 
 
+# Words suggesting a shot depicts harm, injury, or acute distress.
+#
+# Deliberately broad — a false positive costs only a slightly wider shot, while
+# a false negative costs a refused generation plus a wasted keyframe. Erring
+# toward wide is the cheap direction.
+#
+# Lives here rather than in a provider so both the prompt layer and the script
+# validator can ask the same question and get the same answer.
+_SENSITIVE_MARKERS = (
+    "bruise", "blood", "bleed", "wound", "injur", "scar", "swollen", "welt",
+    "cut", "burn", "mark on", "conceal", "cover up", "hide the",
+    "flinch", "cower", "cringe", "tremble", "shaking", "sob", "weep",
+    "cry", "tears", "terrified", "afraid", "fear", "panic", "grab",
+    "strike", "hit", "slap", "punch", "shove", "push", "choke", "drag",
+)
+
+
+def is_sensitive(shot: "Shot") -> bool:
+    """
+    Whether this shot's content risks a safety refusal.
+
+    Sensitive shots keep a prescribed frame; everything else lets the video
+    model choose its own coverage, which produces more natural results.
+    """
+    text = f"{shot.action} {shot.line or ''}".lower()
+    return any(marker in text for marker in _SENSITIVE_MARKERS)
+
+
 class Script(BaseModel):
     """The full shot list — the film, fully specified but not yet rendered."""
 
@@ -257,7 +370,7 @@ class Script(BaseModel):
     shots: list[Shot]
 
     def runtime_seconds(self) -> int:
-        """Total runtime. Should always be 120 for v1."""
+        """Total runtime, derived from the shots actually present."""
         return len(self.shots) * SHOT_DURATION_SECONDS
 
 
@@ -273,6 +386,11 @@ class JobState(BaseModel):
     job_id: str
     premise: str
     mode: Mode
+
+    # Which format this film is. Stored on the job because every later stage
+    # needs it — the treatment prompt branches on structure, the shot list needs
+    # a count, and the cost estimate scales with it.
+    format: Format = DEFAULT_FORMAT
 
     treatment: Treatment | None = None
     bible: StoryBible | None = None

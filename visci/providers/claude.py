@@ -25,13 +25,14 @@ from visci.ledger import (
     CLAUDE_OUTPUT_USD_PER_TOKEN,
 )
 from visci.models import (
-    SHOT_COUNT,
+    Format,
     Framing,
     Mode,
     Script,
     Shot,
     StoryBible,
     Treatment,
+    is_sensitive,
 )
 from visci.prompts.story import (
     bible_prompt,
@@ -130,22 +131,26 @@ class ClaudeStoryProvider:
 
     # -------------------------------------------------------------- stages --
 
-    def treatment(self, premise: str, mode: Mode) -> tuple[Treatment, CostReport]:
-        """Stage 1: premise -> three-act beat sheet, sized in shots."""
+    def treatment(
+        self, premise: str, mode: Mode, fmt: Format = Format.FILM
+    ) -> tuple[Treatment, CostReport]:
+        """Stage 1: premise -> beat sheet, sized in shots."""
         treatment, cost = self._parse(
-            treatment_prompt(premise, mode), Treatment, "treatment"
+            treatment_prompt(premise, mode, fmt), Treatment, "treatment"
         )
 
         # Claude is asked for beats totalling exactly SHOT_COUNT, but a schema
         # cannot enforce a sum. Check it here rather than discovering the film
         # is the wrong length after generating video.
         total = sum(b.shot_count for b in treatment.beats)
-        if total != SHOT_COUNT:
-            treatment = self._rebalance(treatment, total)
+        if total != fmt.shot_count:
+            treatment = self._rebalance(treatment, total, fmt.shot_count)
 
         return treatment, cost
 
-    def _rebalance(self, treatment: Treatment, total: int) -> Treatment:
+    def _rebalance(
+        self, treatment: Treatment, total: int, target: int
+    ) -> Treatment:
         """
         Nudge beat shot-counts so they total exactly SHOT_COUNT.
 
@@ -153,7 +158,7 @@ class ClaudeStoryProvider:
         again), we adjust the largest beats. The story is unaffected — a beat
         going from 4 shots to 3 loses no content, it just gets tighter.
         """
-        difference = SHOT_COUNT - total
+        difference = target - total
         beats = sorted(treatment.beats, key=lambda b: b.shot_count, reverse=True)
 
         while difference != 0:
@@ -169,7 +174,9 @@ class ClaudeStoryProvider:
 
         return treatment
 
-    def bible(self, treatment: Treatment, mode: Mode) -> tuple[StoryBible, CostReport]:
+    def bible(
+        self, treatment: Treatment, mode: Mode, fmt: Format = Format.FILM
+    ) -> tuple[StoryBible, CostReport]:
         """
         Stage 2: treatment -> characters, locations, visual grammar.
 
@@ -179,7 +186,7 @@ class ClaudeStoryProvider:
         failure mode of the whole product.
         """
         bible, cost = self._parse(
-            bible_prompt(treatment, mode), StoryBible, "bible", effort="xhigh"
+            bible_prompt(treatment, mode, fmt), StoryBible, "bible", effort="xhigh"
         )
         # The schema has a `mode` field but Claude has no reason to get it
         # right — we know the answer, so set it authoritatively.
@@ -189,11 +196,11 @@ class ClaudeStoryProvider:
         return bible, cost
 
     def script(
-        self, bible: StoryBible, treatment: Treatment
+        self, bible: StoryBible, treatment: Treatment, fmt: Format = Format.FILM
     ) -> tuple[Script, CostReport]:
         """Stage 3: bible + treatment -> the 15-shot list."""
         shot_list, cost = self._parse(
-            script_prompt(bible, treatment), ShotList, "script"
+            script_prompt(bible, treatment, fmt), ShotList, "script"
         )
 
         shots = shot_list.shots
@@ -204,10 +211,11 @@ class ClaudeStoryProvider:
         for position, shot in enumerate(shots):
             shot.index = position
 
-        if len(shots) != SHOT_COUNT:
+        if len(shots) != fmt.shot_count:
             raise ValueError(
-                f"Expected {SHOT_COUNT} shots, got {len(shots)}. "
-                f"The film would be {len(shots) * 8}s instead of 120s."
+                f"Expected {fmt.shot_count} shots, got {len(shots)}. "
+                f"The film would be {len(shots) * 8}s instead of "
+                f"{fmt.runtime_seconds}s."
             )
 
         _widen_sensitive_shots(shots)
@@ -243,20 +251,6 @@ def _decode_escapes(model: BaseModel) -> None:
                     _decode_escapes(item)
 
 
-# Words that suggest a shot depicts harm, injury, or acute distress. Matched
-# against the action and line text.
-#
-# Deliberately broad — a false positive costs nothing but a slightly wider
-# shot, while a false negative costs a refused generation plus a wasted
-# keyframe. Erring toward wide is the cheap direction.
-_SENSITIVE_MARKERS = (
-    "bruise", "blood", "bleed", "wound", "injur", "scar", "swollen", "welt",
-    "cut", "burn", "mark on", "conceal", "cover up", "hide the",
-    "flinch", "cower", "cringe", "tremble", "shaking", "sob", "weep",
-    "cry", "tears", "terrified", "afraid", "fear", "panic", "grab",
-    "strike", "hit", "slap", "punch", "shove", "push", "choke", "drag",
-)
-
 # Framings too tight for sensitive content, and what to use instead.
 _WIDEN_FOR_SENSITIVE = {
     Framing.CLOSE_UP: Framing.MEDIUM,
@@ -289,6 +283,5 @@ def _widen_sensitive_shots(shots: list[Shot]) -> None:
         if wider is None:
             continue
 
-        text = f"{shot.action} {shot.line or ''}".lower()
-        if any(marker in text for marker in _SENSITIVE_MARKERS):
+        if is_sensitive(shot):
             shot.framing = wider

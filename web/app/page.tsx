@@ -14,7 +14,7 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import { type Mode } from "@/lib/api";
+import { type Format, type Mode } from "@/lib/api";
 import { useConfig, useCreateJob } from "@/lib/queries";
 
 const EXAMPLES = [
@@ -27,6 +27,8 @@ export default function Home() {
   const router = useRouter();
   const [premise, setPremise] = useState("");
   const [mode, setMode] = useState<Mode>("dialogue");
+  // 30-second short is the default: a third of the cost of a full film.
+  const [format, setFormat] = useState<Format>("short");
   const [real, setReal] = useState(false);
   const [draft, setDraft] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -42,11 +44,12 @@ export default function Home() {
   // `isPending` replaces the manual `busy` flag.
   const createJob = useCreateJob();
 
-  const cost = real
-    ? draft
-      ? config?.estimated_cost_draft ?? 10
-      : config?.estimated_cost_full ?? 16
-    : 0;
+  const info = config?.formats[format];
+  const cost = real ? (draft ? info?.cost_draft : info?.cost_full) ?? 0 : 0;
+
+  // A short generates in roughly a quarter of the time of a full film, which
+  // is worth showing — it is as much a reason to choose it as the price.
+  const minutes = format === "short" ? "3–5 min" : "8–15 min";
 
   async function start() {
     if (premise.trim().length < 10) {
@@ -62,6 +65,7 @@ export default function Home() {
       const job = await createJob.mutateAsync({
         premise: premise.trim(),
         mode,
+        format,
         real,
         draft,
       });
@@ -78,25 +82,39 @@ export default function Home() {
           What&rsquo;s the film?
         </h1>
         <p className="mt-3 text-base text-[var(--ink-soft)] sm:text-lg">
-          One idea becomes a two-minute vertical short — script, characters,
-          shots, and sound.
+          One idea becomes a vertical film — script, characters, shots, and
+          sound.
         </p>
       </header>
 
       {/* The composer: one raised surface containing the input and its controls,
           rather than separate boxes. Borrowed from chat interfaces, where the
-          input and its options read as a single instrument. */}
+          input and its options read as a single instrument.
+
+          The placeholder is deliberately short and generic. It previously
+          repeated the first example button below verbatim, which made the empty
+          field look pre-filled and wasted what the examples are there to
+          teach. */}
       <section className="overflow-hidden rounded-[var(--r-lg)] bg-[var(--surface)] shadow-2xl shadow-black/40">
         <textarea
           value={premise}
           onChange={(e) => setPremise(e.target.value)}
           rows={4}
-          placeholder="A lighthouse keeper receives a transmission from a ship that sank forty years ago…"
+          placeholder="An idea, in a sentence or two…"
           aria-label="Your film idea"
           className="w-full resize-none bg-transparent px-4 pb-4 pt-5 text-base leading-relaxed outline-none placeholder:text-[var(--ink-faint)] sm:px-6 sm:pt-6 sm:text-[17px]"
         />
 
         <div className="flex flex-wrap items-center gap-2 px-3 pb-3 sm:px-4 sm:pb-4">
+          <Segmented
+            value={format}
+            onChange={setFormat}
+            options={[
+              { value: "short", label: "30 sec" },
+              { value: "film", label: "2 min" },
+            ]}
+          />
+
           <Segmented
             value={mode}
             onChange={setMode}
@@ -110,15 +128,28 @@ export default function Home() {
             {real ? "Real generation" : "Free preview"}
           </Toggle>
 
+          {/* A quality PAIR rather than a single toggle. As one switch labelled
+              "Draft", turning it off to get the better model required knowing
+              that Draft maps to Veo Lite and its absence to Veo Fast — the
+              relationship was invisible. Two named options show the choice. */}
           {real && (
-            <Toggle active={draft} onClick={() => setDraft(!draft)}>
-              {draft ? "Draft" : "Full quality"}
-            </Toggle>
+            <Segmented
+              value={draft ? "draft" : "standard"}
+              onChange={(v) => setDraft(v === "draft")}
+              options={[
+                { value: "draft", label: "Draft" },
+                { value: "standard", label: "Standard" },
+              ]}
+            />
           )}
 
           <span className="ml-auto flex items-center gap-2 sm:gap-3">
             <span className="font-mono text-xs text-[var(--ink-faint)] tabular-nums">
-              {real ? `~$${cost.toFixed(2)} · 8–15 min` : "free · instant"}
+              {real
+                ? `${draft ? "Veo Lite" : "Veo Fast"} · ~$${cost.toFixed(
+                    2
+                  )} · ${minutes}`
+                : "free · instant"}
             </span>
             <button
               onClick={start}

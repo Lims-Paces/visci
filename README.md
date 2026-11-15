@@ -40,6 +40,7 @@ That produces a real, playable 720×1280 MP4 in `output/`. It costs nothing and
 takes about a second, because it runs against mock providers.
 
 ```bash
+visci generate "..." --format film      # 2 minutes instead of 30 seconds
 visci generate "..." --mode narration   # voice-over instead of on-screen dialogue
 visci config                            # show settings and whether keys are set
 pytest                                  # 13 tests, ~4 seconds
@@ -64,19 +65,31 @@ actually writes for 60 cents, without touching the 88% of cost that is video.
 
 ---
 
-## Locked v1 constraints
+## Two formats
 
-These are deliberate, and several are dictated by the Veo API rather than chosen:
+| | Shots | Runtime | Draft cost | Time |
+|---|---|---|---|---|
+| **Short** (default) | 4 | 32s (shown as 30s) | ~$4.32 | 3–5 min |
+| **Film** | 15 | 120s | ~$10.15 | 8–15 min |
+
+These are not one format with a duration slider. **A four-shot short is a
+different form**: one image, one beat, one hit, with no room for three acts —
+attempting them produces something rushed and unfinished. So the story prompts
+branch on format, not just the arithmetic.
+
+Runtime can only move in 8-second steps because Veo requires 8s clips when
+using reference images, which we depend on for character consistency. That is
+why "30 seconds" is really 32.
+
+## Other locked constraints
+
+Dictated by the Veo API rather than chosen:
 
 | | Value | Why |
 |---|---|---|
-| Runtime | 120s | Cost and consistency both degrade with length |
-| Shots | 15 × 8s | Veo accepts only 4/6/8s, and **requires 8s** with reference images |
+| Shot length | 8s | Veo accepts only 4/6/8s, and **requires 8s** with reference images |
 | Aspect | 9:16 | Vertical framing prevents the crowded shots models handle worst |
 | Resolution | 720p | The **only** tier where Veo scene extension works |
-
-Runtime is the one constraint to treat as product-defining. Aspect and
-resolution lift easily later; runtime multiplies cost, wall-clock, and drift.
 
 ---
 

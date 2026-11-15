@@ -32,7 +32,7 @@ from pydantic import BaseModel, Field
 
 from visci.config import OUTPUT_DIR, settings
 from visci.export import script_docx, script_fountain
-from visci.models import JobState, Mode
+from visci.models import DEFAULT_FORMAT, Format, JobState, Mode
 from visci.pipeline.run import Job
 from visci.providers.base import Providers
 from visci.providers.mock import (
@@ -69,6 +69,10 @@ class CreateJobRequest(BaseModel):
     premise: str = Field(min_length=10, max_length=2000)
     mode: Mode = Mode.DIALOGUE
 
+    # Defaults to the 30-second short: a third of the cost, and the right
+    # starting point for someone trying the product.
+    format: Format = DEFAULT_FORMAT
+
     # Real generation costs money, so it is opt-in at the API level too — the
     # same "safe by default" rule the CLI follows.
     real: bool = False
@@ -96,6 +100,8 @@ class JobStatus(BaseModel):
     job_id: str
     premise: str
     mode: Mode
+    format: Format
+    runtime_seconds: int
 
     # Which pipeline stage we are on, for the top-level progress display.
     stage: str
@@ -205,6 +211,8 @@ def _to_status(state: JobState, job_id: str) -> JobStatus:
         job_id=job_id,
         premise=state.premise,
         mode=state.mode,
+        format=state.format,
+        runtime_seconds=state.format.runtime_seconds,
         stage=stage,
         stage_number=number,
         title=state.bible.title if state.bible else None,
@@ -235,7 +243,7 @@ def create_job(req: CreateJobRequest) -> JobStatus:
         # Missing or malformed API key — a setup problem, not a server fault.
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    job = Job(job_id, req.premise, req.mode, providers)
+    job = Job(job_id, req.premise, req.mode, providers, req.format)
     job.save()  # write initial state so the very first poll finds something
 
     def run() -> None:
@@ -254,6 +262,43 @@ def create_job(req: CreateJobRequest) -> JobStatus:
     return _to_status(job.state, job_id)
 
 
+@app.on_event("startup")
+def mark_stranded_jobs() -> None:
+    """
+    Flag jobs that were mid-generation when the server last stopped.
+
+    Jobs run in daemon threads, so killing the server kills them without any
+    exception being raised — `state.json` is left saying "generating" forever
+    and the UI polls a job that will never progress.
+
+    Since this process is the only thing that could have been running them, any
+    unfinished job found at startup is by definition stranded. Marking them
+    tells the user what happened and offers the fix, instead of leaving a
+    spinner that never resolves.
+    """
+    if not OUTPUT_DIR.exists():
+        return
+
+    for d in OUTPUT_DIR.iterdir():
+        if not d.is_dir():
+            continue
+        state = _read_state(d.name)
+        if state is None or state.error:
+            continue
+        finished = state.final_video_path and Path(state.final_video_path).exists()
+        if finished or state.script is None:
+            continue
+        # Has a script but no finished film, and nothing is running it.
+        done = sum(1 for s in state.script.shots if s.video_path)
+        if done < len(state.script.shots):
+            state.error = (
+                "Generation stopped when the server restarted. "
+                f"{done} of {len(state.script.shots)} shots were finished and "
+                "are saved — resume this job to continue from there."
+            )
+            (d / "state.json").write_text(state.model_dump_json(indent=2))
+
+
 @app.get("/api/jobs/{job_id}", response_model=JobStatus)
 def get_job(job_id: str) -> JobStatus:
     """Current progress. The client polls this every couple of seconds."""
@@ -264,6 +309,48 @@ def get_job(job_id: str) -> JobStatus:
     status = _to_status(state, job_id)
     status.error = state.error
     return status
+
+
+@app.post("/api/jobs/{job_id}/resume", response_model=JobStatus)
+def resume_job(job_id: str, real: bool = True, draft: bool = True) -> JobStatus:
+    """
+    Continue a job that stopped partway.
+
+    Everything already generated is kept — the script, the reference sheets,
+    and every finished clip. Only the missing shots are regenerated, which is
+    what turns an interrupted $6 run into a $2 one.
+    """
+    state = _read_state(job_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job_id in _running:
+        raise HTTPException(status_code=409, detail="Job is already running")
+
+    try:
+        providers = _providers(real, draft)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    job = Job(job_id, state.premise, state.mode, providers, state.format)
+    # Clear the stranded/failed marker so the UI stops showing it and resumes
+    # polling. If it fails again, the new error replaces this one.
+    job.state.error = None
+    job.save()
+
+    def run() -> None:
+        try:
+            job.run()
+        except Exception as exc:  # noqa: BLE001 — surface any failure to the UI
+            job.state.error = str(exc)
+            job.save()
+        finally:
+            _running.pop(job_id, None)
+
+    thread = threading.Thread(target=run, daemon=True, name=f"job-{job_id}")
+    _running[job_id] = thread
+    thread.start()
+
+    return _to_status(job.state, job_id)
 
 
 @app.get("/api/jobs")
@@ -285,6 +372,7 @@ def list_jobs() -> list[dict]:
                 "title": state.bible.title if state.bible else None,
                 "premise": state.premise[:120],
                 "mode": state.mode.value,
+                "runtime_seconds": state.format.runtime_seconds,
                 "finished": bool(
                     state.final_video_path and Path(state.final_video_path).exists()
                 ),
@@ -416,8 +504,17 @@ def get_config() -> dict:
     return {
         "has_anthropic_key": bool(settings.anthropic_api_key),
         "has_gemini_key": bool(settings.gemini_api_key),
-        "estimated_cost_draft": 10.0,
-        "estimated_cost_full": 16.0,
-        "runtime_seconds": 120,
-        "shot_count": 15,
+        # Per-format estimates, so the UI can price the choice the user is
+        # actually making rather than a single hardcoded number.
+        "formats": {
+            fmt.value: {
+                "label": fmt.label,
+                "shot_count": fmt.shot_count,
+                "runtime_seconds": fmt.runtime_seconds,
+                "cost_draft": round(2.2 + 0.53 * fmt.shot_count, 2),
+                "cost_full": round(2.2 + 0.93 * fmt.shot_count, 2),
+            }
+            for fmt in Format
+        },
+        "default_format": DEFAULT_FORMAT.value,
     }

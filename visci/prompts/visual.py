@@ -16,30 +16,53 @@ So these functions are mostly string assembly, and the discipline is: quote the
 bible, don't rewrite it.
 """
 
-from visci.models import Character, Framing, Shot, StoryBible
+from visci.models import Character, Framing, Shot, StoryBible, is_sensitive
 
-# How each framing should be phrased to an image model. The enum values are
-# snake_case for code; these are the cinematic terms the models understand.
-FRAMING_LANGUAGE: dict[Framing, str] = {
+# Phrasing used ONLY where a shot's content risks a safety refusal.
+#
+# Everywhere else we send Claude's own camera direction verbatim — it knows the
+# whole film, the vertical frame, and what this moment needs, none of which a
+# lookup table can encode.
+#
+# But on sensitive content the frame must stay wide enough that the difficult
+# element sits in context rather than filling the image, because a tight frame
+# on an injury is what gets refused. That is a safety constraint, not a
+# creative one, so it overrides whatever Claude wrote.
+FRAMING_STRICT: dict[Framing, str] = {
     Framing.CLOSE_UP: (
-        "tight close-up, face fills the vertical frame, shallow depth of field"
+        "medium close-up, head and shoulders, the room visible around them"
     ),
     Framing.MEDIUM_CLOSE_UP: (
         "medium close-up, head and shoulders, background softly out of focus"
     ),
-    Framing.MEDIUM: "medium shot, waist up, subject centred in the vertical frame",
+    Framing.MEDIUM: (
+        "medium shot, waist up, the subject seen in the context of the room "
+        "around them rather than filling the frame"
+    ),
     Framing.OVER_THE_SHOULDER: (
         "over-the-shoulder shot, foreground shoulder soft and out of focus"
     ),
     Framing.LOW_ANGLE_FULL_BODY: (
-        "low angle full body shot, camera below eye level looking up, "
-        "subject fills the tall frame"
+        "full body shot from slightly below, the whole figure in the frame"
     ),
-    Framing.HIGH_ANGLE: "high angle shot looking down at the subject",
+    Framing.HIGH_ANGLE: "shot from above, the subject small in the frame",
     Framing.INSERT_DETAIL: (
-        "extreme close-up insert of a detail, macro, no face visible"
+        "insert of a detail, no face in frame, the object seen in its setting"
     ),
 }
+
+
+def camera_direction(shot: Shot) -> str:
+    """
+    How this shot is covered.
+
+    Claude's own direction, except on sensitive shots — where a prescribed
+    wider frame is what keeps the generation from being refused, and so
+    overrides the creative choice.
+    """
+    if is_sensitive(shot):
+        return FRAMING_STRICT[shot.framing]
+    return shot.camera
 
 
 def style_block(bible: StoryBible) -> str:
@@ -114,8 +137,11 @@ def keyframe_prompt(shot: Shot, bible: StoryBible) -> str:
         (loc for loc in bible.locations if loc.name == shot.location_name), None
     )
 
+    # Sensitive content keeps a prescribed frame — a tight shot on an injury or
+    # visible distress is what gets refused. Everything else gets a suggestion,
+    # leaving the exact composition to the model.
     parts = [
-        f"Vertical 9:16 film still. {FRAMING_LANGUAGE[shot.framing]}.",
+        f"Vertical 9:16 film still. {camera_direction(shot)}",
         "",
         f"ACTION: {shot.action}",
     ]
@@ -135,8 +161,9 @@ def keyframe_prompt(shot: Shot, bible: StoryBible) -> str:
     parts += [
         "",
         (
-            "Composed for a tall vertical frame. Cinematic, photographic, "
-            "not illustrated. No text, no watermarks, no letterboxing."
+            "Cinematic, photographic, not illustrated. Compose exactly as "
+            "the camera direction above describes. No text, no watermarks, "
+            "no letterboxing."
         ),
     ]
 
@@ -161,21 +188,53 @@ WIDER_FRAMING: dict[Framing, Framing] = {
 }
 
 
+# Appended to every video prompt.
+#
+# WHY THIS EXISTS
+# ---------------
+# Generated movement reads as unnatural in a specific, diagnosable way: bodies
+# move all at once, at a constant speed, with no sense of weight. Real human
+# motion has three properties these models drop unless told otherwise:
+#
+#   ANTICIPATION  a body shifts weight BEFORE it moves
+#   SEQUENCING    parts move in order — eyes lead, then head, then shoulders
+#   SETTLING      movement decelerates into stillness, it does not just cease
+#
+# Naming them explicitly helps. "Natural motion" alone does not, because it
+# does not tell the model what natural motion is made of.
+MOTION_DIRECTION = (
+    "MOTION: Move like a real body. Shift weight before moving. Let one part "
+    "lead and the rest follow — eyes before head, head before shoulders. Ease "
+    "into stillness rather than stopping dead. Keep small involuntary life "
+    "going throughout: breath, blinks, tiny adjustments of balance. One clear "
+    "action across the whole shot at an unhurried human tempo, not several "
+    "actions rushed together."
+)
+
+
 def video_prompt(shot: Shot, bible: StoryBible) -> str:
     """
     Prompt for animating a keyframe into an 8-second clip.
 
-    Different emphasis to the keyframe prompt: the still already establishes
-    WHO and WHERE, so this concentrates on MOTION — what moves, how the camera
-    behaves, and (in dialogue mode) what is said.
+    DELIBERATELY SHORT
+    ------------------
+    The keyframe is passed alongside this prompt, so the model can already SEE
+    the location, wardrobe, lighting, and composition. Re-describing them here
+    spends its attention on things that are not moving.
 
-    Keep motion modest. Eight seconds is short, and ambitious camera moves are
-    where these models most visibly fall apart.
+    An earlier version emitted ~500 words, of which about 60 described the
+    actual movement — the rest was film-stock references and colour theory
+    duplicated from the style block. It also emitted CAMERA twice with
+    contradictory instructions: "subtle movement only" alongside a description
+    of handheld drift, dolly-ins, and push-ins.
+
+    So this now sends framing, what moves, the line, and how bodies should
+    behave. Nothing the still already answers.
     """
     parts = [
-        f"{FRAMING_LANGUAGE[shot.framing]}.",
+        camera_direction(shot),
         "",
-        f"ACTION: {shot.action}",
+        f"WHAT HAPPENS: {shot.action}",
     ]
 
     if shot.line and shot.speaker:
@@ -188,14 +247,20 @@ def video_prompt(shot: Shot, bible: StoryBible) -> str:
 
     parts += [
         "",
+        MOTION_DIRECTION,
+        "",
+        # Camera behaviour ONLY — no lens or grade detail, which the keyframe
+        # already carries. Ambitious camera moves are where these models most
+        # visibly fall apart, so we ask for very little.
         (
-            f"CAMERA: {bible.lens_language} Subtle movement only — "
-            f"a slow push, a gentle drift, or a locked-off static frame."
+            "CAMERA: Hold the frame nearly still — locked off, or at most a "
+            "very slow push or gentle handheld drift. No whip pans, no sudden "
+            "reframes, no zooms."
         ),
         "",
-        style_block(bible),
+        f"Tone: {bible.tone}",
         "",
-        "Continuous single shot, no cuts. Natural motion.",
+        "Continuous single take. No cuts, no scene change.",
     ]
 
     return "\n".join(parts)

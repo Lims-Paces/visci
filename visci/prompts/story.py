@@ -12,9 +12,8 @@ you make a meaningful change.
 
 from visci.models import (
     NARRATION_WORDS_PER_SHOT_GUIDE,
-    SHOT_COUNT,
     SHOT_DURATION_SECONDS,
-    TARGET_RUNTIME_SECONDS,
+    Format,
     Framing,
     Mode,
     NarrationPerson,
@@ -37,13 +36,14 @@ PROMPT_VERSION = "v2"
 # cannot hold three people" produces better shot lists than "max 2 characters".
 # ---------------------------------------------------------------------------
 
-MEDIUM_BRIEF = f"""\
+def medium_brief(fmt: Format) -> str:
+    return f"""\
 You are writing for a very specific medium with hard physical constraints. \
 Understanding them is essential to writing well for it.
 
 THE FORMAT
-- The finished film is exactly {TARGET_RUNTIME_SECONDS} seconds long.
-- It is built from exactly {SHOT_COUNT} shots, each exactly \
+- The finished film is exactly {fmt.runtime_seconds} seconds long.
+- It is built from exactly {fmt.shot_count} shots, each exactly \
 {SHOT_DURATION_SECONDS} seconds. This is fixed by the generation API and \
 cannot vary.
 - The frame is VERTICAL (9:16), like a phone screen held upright.
@@ -97,25 +97,46 @@ photograph, not the fist.\
 """
 
 
-def treatment_prompt(premise: str, mode: Mode) -> str:
-    """Stage 1: premise -> three-act beat sheet, sized in shots."""
+def treatment_prompt(premise: str, mode: Mode, fmt: Format) -> str:
+    """Stage 1: premise -> beat sheet, sized in shots."""
     mode_note = (
         "This is a DIALOGUE film. Characters speak on camera."
         if mode is Mode.DIALOGUE
         else "This is a NARRATION film. A single voice narrates over the images."
     )
-    return f"""{MEDIUM_BRIEF}
 
-{mode_note}
+    # A four-shot short is NOT a compressed three-act film. Asking for three
+    # acts in four shots produces incoherence — a rushed setup, no middle, and
+    # a punchline. So the two formats get genuinely different instructions.
+    if fmt is Format.SHORT:
+        structure = f"""\
+Expand this into a treatment for a THIRTY-SECOND SHORT.
 
-THE PREMISE
-{premise}
+This is a single charged moment, not a compressed film. You have \
+{fmt.shot_count} shots. There is no room for three acts, and attempting them \
+produces something that feels rushed and unfinished.
 
-YOUR TASK
-Expand this into a three-act treatment.
+The shape that works:
+  1. An image that establishes the situation immediately, with no preamble.
+  2. The thing happening.
+  3. The consequence, or the reveal.
+
+Break it into beats totalling EXACTLY {fmt.shot_count} shots. Most beats are \
+one shot; two at most.
+
+Start in the middle. Do not explain how we got here — the audience does not \
+need it, and you do not have the seconds to spend. End on the strongest image, \
+not on a resolution.
+
+Set `act` to 1 for all beats — a short has no act structure.
+
+Write a title that is specific and evocative, never generic."""
+    else:
+        structure = f"""\
+Expand this into a THREE-ACT treatment.
 
 Break it into story beats. Each beat gets a number of shots, and those numbers \
-must total EXACTLY {SHOT_COUNT}.
+must total EXACTLY {fmt.shot_count}.
 
 Think in shots, not seconds — a beat is 1 to 4 shots. A beat that needs more \
 than 4 is really two beats.
@@ -125,8 +146,18 @@ if the story genuinely needs otherwise.
 
 Write a title that is specific and evocative, never generic."""
 
+    return f"""{medium_brief(fmt)}
 
-def bible_prompt(treatment: Treatment, mode: Mode) -> str:
+{mode_note}
+
+THE PREMISE
+{premise}
+
+YOUR TASK
+{structure}"""
+
+
+def bible_prompt(treatment: Treatment, mode: Mode, fmt: Format) -> str:
     """Stage 2: treatment -> characters, locations, visual grammar."""
     beats = "\n".join(
         f"  Act {b.act}, {b.shot_count} shot(s): {b.summary}" for b in treatment.beats
@@ -146,7 +177,7 @@ fable-like, flexible. The safe choice.
 Pick the one that genuinely serves this story.
 """
 
-    return f"""{MEDIUM_BRIEF}
+    return f"""{medium_brief(fmt)}
 
 THE TREATMENT
 Title: {treatment.title}
@@ -177,11 +208,11 @@ Keep the cast SMALL. One or two characters is ideal for this format. Three is \
 the absolute maximum, and only if they never share a frame.
 
 For visual_style, color_palette, and lens_language: these apply to every shot \
-and are what make fifteen separate clips feel like one film. Be specific and \
+and are what make {fmt.shot_count} separate clips feel like one film. Be specific and \
 committed. Name film stocks, reference real cinematography."""
 
 
-def script_prompt(bible: StoryBible, treatment: Treatment) -> str:
+def script_prompt(bible: StoryBible, treatment: Treatment, fmt: Format) -> str:
     """Stage 3: bible + treatment -> the 15-shot list."""
     characters = "\n".join(
         f"  {c.name} ({c.role}): {c.face} | Wears: {c.wardrobe}"
@@ -219,7 +250,7 @@ overrun its shot and desynchronise from the picture.
 Narration should COUNTERPOINT the image, not describe it. If we see her open \
 the door, do not say "she opens the door". Say what it costs her."""
 
-    return f"""{MEDIUM_BRIEF}
+    return f"""{medium_brief(fmt)}
 
 THE STORY BIBLE (frozen — treat every word as fixed)
 Title: {bible.title}
@@ -241,7 +272,7 @@ THE BEATS
 {line_note}
 
 YOUR TASK
-Write the shot list: EXACTLY {SHOT_COUNT} shots, following the beats in order \
+Write the shot list: EXACTLY {fmt.shot_count} shots, following the beats in order \
 and giving each beat its allotted number of shots.
 
 For each shot:
@@ -250,15 +281,37 @@ For each shot:
 No thoughts, no feelings, no backstory. "Her hand stops halfway to the \
 handle" not "she hesitates, remembering".
 
-`framing` — choose from exactly these:
+`framing` — the broad shot size. Choose from exactly these:
 {framings}
+
+`camera` — THE ACTUAL CAMERA DIRECTION, and one of the most important things \
+you write. You are the cinematographer here: the video model sees only a single \
+image and a paragraph, while you know the whole film. Do not write a category \
+back to me — describe the shot.
+
+Say the lens, the angle, where the subject sits in the TALL VERTICAL FRAME, \
+what is sharp and what falls away. The 9:16 frame is the thing to think hardest \
+about: it is a portrait window, generous vertically and cramped horizontally.
+
+Bad:   "close up of her face"
+Good:  "85mm, her face in the upper third of the tall frame, the empty hallway \
+running away below her, everything past two feet falling to soft bokeh"
+
+Two people is the hard case in a vertical frame, and a flat side-by-side \
+two-shot does not fit. Solve it deliberately — stack them in depth with one \
+soft in the foreground, shoot over a shoulder, use a mirror, or put one at the \
+top of frame and one at the bottom. Say which you are doing.
+
+Use the vertical space. A figure small at the bottom with a ceiling above them \
+reads very differently from a face filling the frame, and only the tall format \
+gives you that.
 
 `character_names` — at most TWO, and prefer one. A vertical frame cannot hold \
 more.
 
 `location_name` — must match a location from the bible exactly.
 
-VARY THE FRAMING. Fifteen medium shots in a row is visually dead. Cut between \
+VARY THE FRAMING. A run of identical framings is visually dead. Cut between \
 scales — a close-up lands harder after a wide, an insert of a detail gives the \
 eye somewhere to rest.
 

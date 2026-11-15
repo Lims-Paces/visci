@@ -119,7 +119,9 @@ export default function Shell({ children }: { children: React.ReactNode }) {
                         <span className="h-1.5 w-1.5 rounded-full bg-[var(--warn)] breathe" />
                       )}
                       <span className="font-mono text-[10px] text-[var(--ink-faint)] tabular-nums">
-                        {job.finished ? "2:00" : "in progress"}
+                        {job.finished
+                          ? `${Math.round(job.runtime_seconds / 60)}:${String(job.runtime_seconds % 60).padStart(2, "0")}`
+                          : "in progress"}
                         {job.cost_usd > 0 && ` · $${job.cost_usd.toFixed(2)}`}
                       </span>
                     </span>

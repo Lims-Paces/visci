@@ -25,6 +25,7 @@ from visci.config import FIXTURES_DIR
 from visci.models import (
     Beat,
     Character,
+    Format,
     Framing,
     Location,
     Mode,
@@ -38,11 +39,56 @@ from visci.providers.base import CostReport
 
 FREE = CostReport(0.0, "mock")
 
+# Camera direction the mock attaches to each shot. Written the way a
+# cinematographer would — thinking about the tall vertical frame — so the mock
+# produces the same SHAPE of data the real provider does, not a simplified one.
+_CAM_LOW = (
+    "35mm from just below eye level, the figure in the lower two thirds, "
+    "the tower stair spiralling away above her"
+)
+_CAM_MEDIUM = (
+    "50mm at eye level, waist up, centred, the lamp mechanism soft behind "
+    "her shoulder"
+)
+_CAM_CLOSE = (
+    "85mm, her face in the upper third of the tall frame, everything past "
+    "a foot falling to bokeh"
+)
+_CAM_INSERT = (
+    "100mm macro on her hand at the dial, filling the width, the room dark "
+    "above and below"
+)
+_CAM_MCU = (
+    "85mm, head and shoulders low in frame with the ceiling pressing down "
+    "above her"
+)
+
 
 class MockStoryProvider:
     """Returns a fixed, coherent little story regardless of the premise."""
 
-    def treatment(self, premise: str, mode: Mode) -> tuple[Treatment, CostReport]:
+    def treatment(
+        self, premise: str, mode: Mode, fmt: Format = Format.FILM
+    ) -> tuple[Treatment, CostReport]:
+        # A SHORT gets a genuinely different beat sheet, not a truncated one —
+        # the mock should exercise the same branching the real provider does.
+        if fmt is Format.SHORT:
+            return (
+                Treatment(
+                    title="The Last Signal",
+                    logline=(
+                        "A lighthouse keeper answers a distress call from a "
+                        "ship that sank forty years ago."
+                    ),
+                    beats=[
+                        Beat(act=1, summary="The radio crackles in an empty tower.", shot_count=1),
+                        Beat(act=1, summary="She recognises the ship's name.", shot_count=1),
+                        Beat(act=1, summary="She answers it.", shot_count=1),
+                        Beat(act=1, summary="The lamp goes out.", shot_count=1),
+                    ],
+                ),
+                FREE,
+            )
         return (
             Treatment(
                 title="The Last Signal",
@@ -62,7 +108,9 @@ class MockStoryProvider:
             FREE,
         )
 
-    def bible(self, treatment: Treatment, mode: Mode) -> tuple[StoryBible, CostReport]:
+    def bible(
+        self, treatment: Treatment, mode: Mode, fmt: Format = Format.FILM
+    ) -> tuple[StoryBible, CostReport]:
         return (
             StoryBible(
                 title=treatment.title,
@@ -121,15 +169,20 @@ class MockStoryProvider:
             FREE,
         )
 
-    def script(self, bible: StoryBible, treatment: Treatment) -> tuple[Script, CostReport]:
+    def script(
+        self, bible: StoryBible, treatment: Treatment, fmt: Format = Format.FILM
+    ) -> tuple[Script, CostReport]:
         # Build exactly as many shots as the beats call for, so the mock exercises
         # the same 15-shot arithmetic the real pipeline uses.
-        framings = [
-            Framing.LOW_ANGLE_FULL_BODY,
-            Framing.MEDIUM,
-            Framing.CLOSE_UP,
-            Framing.INSERT_DETAIL,
-            Framing.MEDIUM_CLOSE_UP,
+        # Framing paired with the camera direction a cinematographer would
+        # actually write for it — the mock should produce the same SHAPE of
+        # data as the real provider, not a simplified version.
+        coverage = [
+            (Framing.LOW_ANGLE_FULL_BODY, _CAM_LOW),
+            (Framing.MEDIUM, _CAM_MEDIUM),
+            (Framing.CLOSE_UP, _CAM_CLOSE),
+            (Framing.INSERT_DETAIL, _CAM_INSERT),
+            (Framing.MEDIUM_CLOSE_UP, _CAM_MCU),
         ]
         shots: list[Shot] = []
         index = 0
@@ -140,7 +193,8 @@ class MockStoryProvider:
                         index=index,
                         character_names=["Mara"],
                         location_name="Lighthouse gallery",
-                        framing=framings[index % len(framings)],
+                        framing=coverage[index % len(coverage)][0],
+                        camera=coverage[index % len(coverage)][1],
                         action=beat.summary,
                         line=f"Mock narration line for shot {index}.",
                         speaker="Mara" if bible.mode is Mode.DIALOGUE else None,

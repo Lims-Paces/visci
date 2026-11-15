@@ -24,7 +24,7 @@ import {
   videoUrl,
   type Shot,
 } from "@/lib/api";
-import { useJob } from "@/lib/queries";
+import { useJob, useResumeJob } from "@/lib/queries";
 
 const STATUS: Record<Shot["status"], { dot: string; label: string }> = {
   done: { dot: "bg-[var(--good)]", label: "ready" },
@@ -40,6 +40,7 @@ export default function JobPage({
 }) {
   const { id } = use(params);
   const [playing, setPlaying] = useState<Shot | null>(null);
+  const resume = useResumeJob(id);
 
   // Replaces ~20 lines of hand-rolled polling.
   //
@@ -123,8 +124,36 @@ export default function JobPage({
           </p>
           {job.shots_done > 0 && (
             <p className="mt-3 text-sm text-[var(--ink-faint)]">
-              {job.shots_done} shots finished and are saved — resuming keeps
-              them.
+              {job.shots_done} of {job.shots_total} shots are finished and
+              saved. Resuming regenerates only what is missing.
+            </p>
+          )}
+
+          {/* An error with no way to act on it is just a dead end. Resuming
+              keeps the script, reference sheets, and every finished clip, so
+              it costs a fraction of starting over. */}
+          <div className="mt-4 flex flex-wrap gap-2">
+            <button
+              onClick={() => resume.mutate(true)}
+              disabled={resume.isPending}
+              className="rounded-full bg-[var(--accent)] px-4 py-2 text-sm font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-40"
+            >
+              {resume.isPending ? "Resuming…" : "Resume · Draft"}
+            </button>
+            <button
+              onClick={() => resume.mutate(false)}
+              disabled={resume.isPending}
+              className="rounded-full bg-[var(--raised)] px-4 py-2 text-sm font-medium transition-colors hover:bg-[var(--hover)] disabled:opacity-40"
+            >
+              Resume · Standard
+            </button>
+          </div>
+
+          {resume.error && (
+            <p className="mt-3 text-sm text-[var(--bad)]">
+              {resume.error instanceof Error
+                ? resume.error.message
+                : "Could not resume."}
             </p>
           )}
         </section>

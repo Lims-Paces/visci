@@ -24,7 +24,7 @@ from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn
 
 from visci.config import OUTPUT_DIR, settings
 from visci.ledger import BudgetExceeded, Ledger
-from visci.models import JobState, Mode, Script, Shot
+from visci.models import DEFAULT_FORMAT, Format, JobState, Mode, Script, Shot
 from visci.pipeline.assemble import assemble, probe_duration
 from visci.pipeline.concurrency import ConcurrencyController, jittered_delay
 from visci.providers.base import ContentRefused, Providers
@@ -35,7 +35,14 @@ console = Console()
 class Job:
     """One film-generation run, with everything it needs to resume."""
 
-    def __init__(self, job_id: str, premise: str, mode: Mode, providers: Providers) -> None:
+    def __init__(
+        self,
+        job_id: str,
+        premise: str,
+        mode: Mode,
+        providers: Providers,
+        fmt: Format = DEFAULT_FORMAT,
+    ) -> None:
         self.dir = OUTPUT_DIR / job_id
         self.dir.mkdir(parents=True, exist_ok=True)
         self.state_file = self.dir / "state.json"
@@ -48,7 +55,9 @@ class Job:
             self.state = JobState.model_validate_json(self.state_file.read_text())
             console.print(f"[yellow]Resuming job {job_id}[/]")
         else:
-            self.state = JobState(job_id=job_id, premise=premise, mode=mode)
+            self.state = JobState(
+                job_id=job_id, premise=premise, mode=mode, format=fmt
+            )
 
     def save(self) -> None:
         """Persist state. Called after every stage — cheap insurance."""
@@ -64,7 +73,7 @@ class Job:
         if self.state.treatment is None:
             console.print("[bold cyan]1/6[/] Expanding premise into a treatment")
             treatment, cost = self.providers.story.treatment(
-                self.state.premise, self.state.mode
+                self.state.premise, self.state.mode, self.state.format
             )
             self.ledger.spend(cost)
             self.state.treatment = treatment
@@ -74,7 +83,9 @@ class Job:
         # -- 2. Story bible -------------------------------------------------
         if self.state.bible is None:
             console.print("[bold cyan]2/6[/] Building the story bible")
-            bible, cost = self.providers.story.bible(self.state.treatment, self.state.mode)
+            bible, cost = self.providers.story.bible(
+                self.state.treatment, self.state.mode, self.state.format
+            )
             self.ledger.spend(cost)
             self.state.bible = bible
             self.save()
@@ -87,7 +98,7 @@ class Job:
         if self.state.script is None:
             console.print("[bold cyan]3/6[/] Writing the shot list")
             script, cost = self.providers.story.script(
-                self.state.bible, self.state.treatment
+                self.state.bible, self.state.treatment, self.state.format
             )
             self.ledger.spend(cost)
             self.state.script = script

@@ -23,6 +23,8 @@ import {
   getConfig,
   getJob,
   listJobs,
+  resumeJob,
+  type Format,
   type JobStatus,
   type Mode,
 } from "./api";
@@ -104,6 +106,25 @@ export function useConfig() {
  * so the sidebar shows the new film immediately rather than up to 8 seconds
  * later on its next poll.
  */
+/**
+ * Resume an interrupted job.
+ *
+ * A mutation, not a query: it writes. On success it seeds the job cache so the
+ * page immediately shows the run as live again rather than waiting for the
+ * next poll to clear the error.
+ */
+export function useResumeJob(id: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (draft: boolean) => resumeJob(id, draft),
+    onSuccess: (job) => {
+      qc.setQueryData(keys.job(id), job);
+      qc.invalidateQueries({ queryKey: keys.jobs });
+    },
+  });
+}
+
+
 export function useCreateJob() {
   const qc = useQueryClient();
 
@@ -111,6 +132,7 @@ export function useCreateJob() {
     mutationFn: (input: {
       premise: string;
       mode: Mode;
+      format: Format;
       real: boolean;
       draft: boolean;
     }) => createJob(input),

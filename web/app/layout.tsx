@@ -5,7 +5,7 @@ import Shell from "./components/Shell";
 
 export const metadata: Metadata = {
   title: "Visci",
-  description: "Generate a two-minute vertical film from a single idea.",
+  description: "Generate a vertical film from a single idea.",
 };
 
 export default function RootLayout({
